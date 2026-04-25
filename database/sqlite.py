@@ -10,6 +10,7 @@ from models import (
     MotivationEntry,
     MotivationalTrack,
     Priority,
+    RecurrenceKind,
     Reminder,
     ReminderKind,
     ReminderStatus,
@@ -82,11 +83,14 @@ class Database:
                     updated_at TEXT NOT NULL,
                     start_reminder_at TEXT NOT NULL,
                     repeat_every_minutes INTEGER NOT NULL,
+                    recurrence_kind TEXT NOT NULL DEFAULT 'none',
+                    recurrence_parent_task_id INTEGER,
                     started_at TEXT,
                     completed_at TEXT,
                     cancelled_at TEXT,
                     postponed_until TEXT,
-                    FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id)
+                    FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_user_id),
+                    FOREIGN KEY (recurrence_parent_task_id) REFERENCES tasks(id) ON DELETE SET NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_tasks_user_status
@@ -191,6 +195,14 @@ class Database:
             )
             self._ensure_column("ai_interactions_log", "user_message", "TEXT")
             self._ensure_column("motivational_tracks", "file_path", "TEXT")
+            self._ensure_column("tasks", "recurrence_kind", "TEXT NOT NULL DEFAULT 'none'")
+            self._ensure_column("tasks", "recurrence_parent_task_id", "INTEGER")
+            self.connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tasks_recurrence_parent
+                    ON tasks (recurrence_parent_task_id)
+                """
+            )
             self.connection.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, column_definition: str) -> None:
@@ -250,6 +262,8 @@ class Database:
         start_reminder_at: datetime,
         repeat_every_minutes: int,
         priority: Priority,
+        recurrence_kind: RecurrenceKind = RecurrenceKind.NONE,
+        recurrence_parent_task_id: Optional[int] = None,
     ) -> Task:
         now = datetime_to_db(utc_now())
         with self._lock:
@@ -257,9 +271,10 @@ class Database:
                 """
                 INSERT INTO tasks (
                     telegram_user_id, chat_id, title, description, status, priority,
-                    created_at, updated_at, start_reminder_at, repeat_every_minutes
+                    created_at, updated_at, start_reminder_at, repeat_every_minutes,
+                    recurrence_kind, recurrence_parent_task_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_user_id,
@@ -272,6 +287,8 @@ class Database:
                     now,
                     datetime_to_db(start_reminder_at),
                     repeat_every_minutes,
+                    recurrence_kind.value,
+                    recurrence_parent_task_id,
                 ),
             )
             self.connection.commit()
@@ -290,6 +307,19 @@ class Database:
             row = self.connection.execute(
                 "SELECT * FROM tasks WHERE id = ? AND telegram_user_id = ?",
                 (task_id, telegram_user_id),
+            ).fetchone()
+            return self._row_to_task(row) if row else None
+
+    def get_recurring_child_task(self, parent_task_id: int) -> Optional[Task]:
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE recurrence_parent_task_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (parent_task_id,),
             ).fetchone()
             return self._row_to_task(row) if row else None
 
@@ -328,6 +358,29 @@ class Database:
             ).fetchall()
             return [self._row_to_task(row) for row in rows]
 
+    def list_task_history_for_user(
+        self,
+        telegram_user_id: int,
+        limit: int = 20,
+    ) -> list[Task]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE telegram_user_id = ?
+                  AND status IN (?, ?)
+                ORDER BY COALESCE(completed_at, cancelled_at, updated_at) DESC
+                LIMIT ?
+                """,
+                (
+                    telegram_user_id,
+                    TaskStatus.DONE.value,
+                    TaskStatus.CANCELLED.value,
+                    limit,
+                ),
+            ).fetchall()
+            return [self._row_to_task(row) for row in rows]
+
     def get_latest_active_task_for_user(self, telegram_user_id: int) -> Optional[Task]:
         with self._lock:
             row = self.connection.execute(
@@ -358,6 +411,8 @@ class Database:
             "priority",
             "start_reminder_at",
             "repeat_every_minutes",
+            "recurrence_kind",
+            "recurrence_parent_task_id",
             "started_at",
             "completed_at",
             "cancelled_at",
@@ -413,6 +468,29 @@ class Database:
             row = self.connection.execute(
                 "SELECT * FROM reminders WHERE id = ?",
                 (reminder_id,),
+            ).fetchone()
+            return self._row_to_reminder(row) if row else None
+
+    def get_scheduled_reminder_for_task(
+        self,
+        task_id: int,
+        kind: ReminderKind | None = None,
+    ) -> Optional[Reminder]:
+        params: list[object] = [task_id, ReminderStatus.SCHEDULED.value]
+        where = "task_id = ? AND status = ?"
+        if kind is not None:
+            where += " AND kind = ?"
+            params.append(kind.value)
+
+        with self._lock:
+            row = self.connection.execute(
+                f"""
+                SELECT * FROM reminders
+                WHERE {where}
+                ORDER BY scheduled_at ASC
+                LIMIT 1
+                """,
+                params,
             ).fetchone()
             return self._row_to_reminder(row) if row else None
 
@@ -860,7 +938,7 @@ class Database:
 
     @staticmethod
     def _serialize_value(value: object) -> object:
-        if isinstance(value, (TaskStatus, Priority)):
+        if isinstance(value, (TaskStatus, Priority, RecurrenceKind)):
             return value.value
         if isinstance(value, datetime):
             return datetime_to_db(value)
@@ -880,6 +958,12 @@ class Database:
             updated_at=datetime_from_db(row["updated_at"]),
             start_reminder_at=datetime_from_db(row["start_reminder_at"]),
             repeat_every_minutes=int(row["repeat_every_minutes"]),
+            recurrence_kind=RecurrenceKind(str(row["recurrence_kind"] or RecurrenceKind.NONE.value)),
+            recurrence_parent_task_id=(
+                int(row["recurrence_parent_task_id"])
+                if row["recurrence_parent_task_id"] is not None
+                else None
+            ),
             started_at=datetime_from_db(row["started_at"]),
             completed_at=datetime_from_db(row["completed_at"]),
             cancelled_at=datetime_from_db(row["cancelled_at"]),

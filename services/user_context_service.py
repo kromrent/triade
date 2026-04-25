@@ -41,6 +41,13 @@ class UserContextService:
         self.database = database
         self.settings = settings
 
+    def preference(self, telegram_user_id: int) -> UserPreference:
+        default_tone = _parse_tone(self.settings.ai_default_tone)
+        return self.database.get_or_create_user_preference(telegram_user_id, default_tone)
+
+    def is_ai_enabled(self, telegram_user_id: int) -> bool:
+        return self.preference(telegram_user_id).ai_enabled
+
     def build_context(
         self,
         telegram_user_id: int,
@@ -49,8 +56,7 @@ class UserContextService:
         tone_override: ToneMode | None = None,
         force_bro_boost: bool = False,
     ) -> UserAIContext:
-        default_tone = _parse_tone(self.settings.ai_default_tone)
-        preference = self.database.get_or_create_user_preference(telegram_user_id, default_tone)
+        preference = self.preference(telegram_user_id)
         task_snooze_count = (
             self.database.count_task_events(task.id, "task_snoozed")
             if task is not None

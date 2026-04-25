@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -14,8 +15,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from keyboards.inline import ai_task_menu_keyboard, task_list_keyboard, tone_mode_keyboard
-from keyboards.reply import main_menu_keyboard
-from models import AIScenario, MotivationalTrack, Priority, TaskStatus, ToneMode, utc_now
+from handlers.text_utils import is_main_menu_text
+from keyboards.reply import confirm_yes_no_keyboard, main_menu_keyboard
+from models import AIScenario, MotivationalTrack, Priority, RecurrenceKind, TaskStatus, ToneMode, utc_now
 from scheduler import ReminderScheduler
 from services.formatting import format_task_list
 from services.intent_service import IntentService, IntentType, TaskAction, TaskQuery
@@ -412,6 +414,23 @@ async def confirm_task_draft(
         await message.answer("Окей, не добавляю.", reply_markup=main_menu_keyboard())
         return
 
+    comment_update = _parse_task_comment_request(text)
+    if comment_update is not None:
+        drafts = _deserialize_task_drafts(data.get("task_drafts", []), user_context_service)
+        updated = _apply_description_to_drafts(drafts, comment_update[0], comment_update[1])
+        if updated:
+            await state.update_data(task_drafts=_serialize_task_drafts(drafts))
+            await message.answer(
+                escape(_format_task_draft_confirmation(drafts, user_context_service)),
+                reply_markup=confirm_yes_no_keyboard(),
+            )
+            return
+        await message.answer(
+            "Не нашел такую задачу в черновике. Напиши точное название из списка или ответь «да», если добавлять без комментария.",
+            reply_markup=confirm_yes_no_keyboard(),
+        )
+        return
+
     original_text = str(data.get("original_text") or "")
     combined_text = (
         f"Исходный запрос пользователя: {original_text}\n"
@@ -423,6 +442,7 @@ async def confirm_task_draft(
         utc_now(),
         user_context_service.settings.tzinfo,
         motivation_service.ai_service,
+        use_ai_classifier=user_context_service.is_ai_enabled(message.from_user.id),
     )
     await state.clear()
 
@@ -498,8 +518,7 @@ async def ai_action_callback(
     StateFilter(None),
     lambda message: bool(message.text)
     and not message.text.startswith("/")
-    and message.text.strip().lower()
-    not in {"добавить задачу", "мои задачи", "активные напоминания", "история задач", "помощь"}
+    and not is_main_menu_text(message.text)
 )
 async def freeform_intent_router(
     message: Message,
@@ -515,21 +534,28 @@ async def freeform_intent_router(
 
     task_service.ensure_user(message.from_user, message.chat.id)
     message_text = message.text or ""
-    if _asks_for_motivation_media(message_text):
-        track = motivation_service.tracks_service.random_focus_file(message.from_user.id)
-        await _send_direct_media_boost(message, track)
-        _schedule_energy_followup(reminder_scheduler, message.from_user.id, message.chat.id, track, None)
+    comment_update = _parse_task_comment_request(message_text)
+    if comment_update is not None:
+        await _handle_task_comment_update(message, comment_update, task_service)
         return
 
     conversation_context = _build_classifier_context(
         user_context_service.database.list_recent_ai_messages(message.from_user.id, limit=6)
     )
+    if _asks_for_motivation_media(message_text, conversation_context):
+        track = motivation_service.tracks_service.random_focus_file(message.from_user.id)
+        await _send_direct_media_boost(message, track)
+        _log_local_media_interaction(task_service, message.from_user.id, message_text, track)
+        _schedule_energy_followup(reminder_scheduler, message.from_user.id, message.chat.id, track, None)
+        return
+
     intent = await intent_service.detect_smart(
         message_text,
         utc_now(),
         user_context_service.settings.tzinfo,
         motivation_service.ai_service,
         conversation_context=conversation_context,
+        use_ai_classifier=user_context_service.is_ai_enabled(message.from_user.id),
     )
 
     if intent.type == IntentType.CREATE_TASK:
@@ -570,7 +596,7 @@ async def freeform_intent_router(
         intent.type == IntentType.MOTIVATION
         and scenario in {AIScenario.BOOST, AIScenario.PROCRASTINATION, AIScenario.COMEBACK, AIScenario.PANIC}
     )
-    task = None if general_support_mode else user_context_service.latest_active_task(message.from_user.id)
+    task = None if general_support_mode or intent.type in {IntentType.GENERAL_CHAT, IntentType.UNKNOWN} else user_context_service.latest_active_task(message.from_user.id)
     if _asks_about_task_list(message_text):
         task = None
     else:
@@ -597,9 +623,10 @@ async def freeform_intent_router(
 
     if intent.type in {IntentType.PROCRASTINATION, IntentType.EMOTIONAL_STATE, IntentType.TASK_HELP, IntentType.MOTIVATION}:
         if scenario == AIScenario.BOOST:
-            if _asks_for_motivation_media(message_text):
+            if _asks_for_motivation_media(message_text, conversation_context):
                 track = motivation_service.tracks_service.random_focus_file(message.from_user.id)
                 await _send_direct_media_boost(message, track)
+                _log_local_media_interaction(task_service, message.from_user.id, message_text, track)
                 _schedule_energy_followup(reminder_scheduler, message.from_user.id, message.chat.id, track, task)
                 return
             text = await motivation_service.compose(
@@ -663,7 +690,7 @@ async def _handle_create_task_intent(
         )
         await message.answer(
             escape(_format_task_draft_confirmation(creations, user_context_service)),
-            reply_markup=main_menu_keyboard(),
+            reply_markup=confirm_yes_no_keyboard(),
         )
         return
 
@@ -688,28 +715,40 @@ async def _create_task_drafts(
 
     local_now = utc_now().astimezone(user_context_service.settings.tzinfo)
     created = []
+    existing = []
     skipped = []
 
     for draft in creations[:10]:
-        reminder_local = draft.remind_at.astimezone(user_context_service.settings.tzinfo)
-        if reminder_local < local_now - timedelta(seconds=30):
+        recurrence_kind = getattr(draft, "recurrence_kind", RecurrenceKind.NONE)
+        resolved_remind_at = _resolve_draft_reminder_at(
+            draft.remind_at,
+            recurrence_kind,
+            local_now,
+            user_context_service.settings.tzinfo,
+        )
+        if resolved_remind_at is None:
+            reminder_local = draft.remind_at.astimezone(user_context_service.settings.tzinfo)
             skipped.append((draft.title, reminder_local))
             continue
 
-        task, reminder = task_service.create_task(
+        creation = task_service.create_task(
             telegram_user_id=message.from_user.id,
             chat_id=message.chat.id,
             title=draft.title,
-            description=None,
-            start_reminder_at=draft.remind_at,
+            description=getattr(draft, "description", None),
+            start_reminder_at=resolved_remind_at,
             repeat_every_minutes=draft.repeat_every_minutes
             or user_context_service.settings.default_repeat_minutes,
             priority=Priority.MEDIUM,
+            recurrence_kind=recurrence_kind,
         )
-        reminder_scheduler.schedule_reminder(reminder)
-        created.append(task)
+        reminder_scheduler.schedule_reminder(creation.reminder)
+        if creation.created_new:
+            created.append(creation.task)
+        else:
+            existing.append(creation.task)
 
-    if not created:
+    if not created and not existing:
         skipped_text = "\n".join(
             f"- {title}: {reminder_at.strftime('%d.%m %H:%M')}" for title, reminder_at in skipped[:5]
         )
@@ -724,26 +763,88 @@ async def _create_task_drafts(
         )
         return
 
-    if len(created) == 1:
-        task = created[0]
-        reminder_time = task.start_reminder_at.astimezone(user_context_service.settings.tzinfo).strftime("%d.%m %H:%M")
-        response = (
-            f"Окей, поставил: {task.title}\n"
-            f"Первое напоминание: {reminder_time}\n"
-            f"Повтор: каждые {task.repeat_every_minutes} мин.\n"
-            "Если не стартуешь, буду дожимать напоминаниями."
-        )
+    if len(created) == 1 and not existing:
+        response = _format_created_task_response(created[0], user_context_service.settings.timezone)
+    elif len(existing) == 1 and not created:
+        response = _format_existing_task_response(existing[0], user_context_service.settings.timezone)
     else:
-        lines = [f"Окей, поставил задач: {len(created)}."]
-        for task in created:
-            reminder_time = task.start_reminder_at.astimezone(user_context_service.settings.tzinfo).strftime("%d.%m %H:%M")
-            lines.append(f"#{task.id} {task.title} — {reminder_time}")
+        lines = []
+        if created:
+            lines.append(f"Новых задач поставил: {len(created)}.")
+            for task in created:
+                reminder_time = task.start_reminder_at.astimezone(user_context_service.settings.tzinfo).strftime("%d.%m %H:%M")
+                lines.append(f"+ #{task.id} {task.title} — {reminder_time}")
+        if existing:
+            if lines:
+                lines.append("")
+            lines.append(f"Такие задачи уже были: {len(existing)}.")
+            for task in existing:
+                reminder_time = task.start_reminder_at.astimezone(user_context_service.settings.tzinfo).strftime("%d.%m %H:%M")
+                lines.append(f"= #{task.id} {task.title} — {reminder_time}")
         response = "\n".join(lines)
 
     if skipped:
         response += f"\n\nНе поставил из-за прошедшего времени: {len(skipped)}."
 
     await message.answer(escape(response), reply_markup=main_menu_keyboard())
+
+
+def _format_created_task_response(task, timezone_name: str) -> str:
+    reminder_time = task.start_reminder_at.astimezone(ZoneInfo(timezone_name)).strftime("%d.%m %H:%M")
+    recurrence = _format_recurrence_label(task.recurrence_kind)
+
+    lines = [
+        f"Окей, поставил: {task.title}",
+        f"Первое напоминание: {reminder_time}",
+    ]
+    if recurrence:
+        lines.append(f"Тип: {recurrence}")
+        lines.append("Следующее повторение создается автоматически.")
+    else:
+        lines.append(f"Повтор: каждые {task.repeat_every_minutes} мин.")
+        lines.append("Если не стартуешь, буду дожимать напоминаниями.")
+    if task.description:
+        lines.append(f"Комментарий: {task.description}")
+    return "\n".join(lines)
+
+
+def _format_existing_task_response(task, timezone_name: str) -> str:
+    reminder_time = task.start_reminder_at.astimezone(ZoneInfo(timezone_name)).strftime("%d.%m %H:%M")
+    recurrence = _format_recurrence_label(task.recurrence_kind)
+
+    lines = [
+        "Такая задача уже есть, новую не добавляю.",
+        f"Задача: {task.title}",
+        f"Первое напоминание: {reminder_time}",
+    ]
+    if recurrence:
+        lines.append(f"Тип: {recurrence}")
+    else:
+        lines.append(f"Повтор: каждые {task.repeat_every_minutes} мин.")
+    if task.description:
+        lines.append(f"Комментарий: {task.description}")
+    return "\n".join(lines)
+
+
+def _resolve_draft_reminder_at(
+    remind_at: datetime,
+    recurrence_kind: RecurrenceKind,
+    local_now: datetime,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    reminder_local = remind_at.astimezone(timezone)
+    threshold = local_now - timedelta(seconds=30)
+    if reminder_local >= threshold:
+        return reminder_local
+    if recurrence_kind == RecurrenceKind.DAILY:
+        while reminder_local < threshold:
+            reminder_local += timedelta(days=1)
+        return reminder_local
+    if recurrence_kind == RecurrenceKind.WEEKLY:
+        while reminder_local < threshold:
+            reminder_local += timedelta(days=7)
+        return reminder_local
+    return None
 
 
 def _task_drafts_from_intent(intent) -> list[SimpleNamespace]:
@@ -754,6 +855,8 @@ def _task_drafts_from_intent(intent) -> list[SimpleNamespace]:
                 title=intent.task_title,
                 remind_at=intent.reminder_at,
                 repeat_every_minutes=intent.repeat_every_minutes,
+                description=getattr(intent, "description", None),
+                recurrence_kind=getattr(intent, "recurrence_kind", RecurrenceKind.NONE),
             )
         ]
     return creations
@@ -767,6 +870,8 @@ def _serialize_task_drafts(creations) -> list[dict[str, object]]:
                 "title": str(draft.title),
                 "remind_at": draft.remind_at.isoformat(),
                 "repeat_every_minutes": draft.repeat_every_minutes,
+                "description": getattr(draft, "description", None),
+                "recurrence_kind": getattr(draft, "recurrence_kind", RecurrenceKind.NONE).value,
             }
         )
     return result
@@ -796,12 +901,15 @@ def _deserialize_task_drafts(raw_drafts, user_context_service: UserContextServic
             repeat_every_minutes = int(repeat_every_minutes) if repeat_every_minutes else None
         except (TypeError, ValueError):
             repeat_every_minutes = None
+        recurrence_kind = _parse_recurrence_kind_value(item.get("recurrence_kind"))
 
         drafts.append(
             SimpleNamespace(
                 title=title,
                 remind_at=remind_at,
                 repeat_every_minutes=repeat_every_minutes,
+                description=_clean_optional_text(item.get("description")),
+                recurrence_kind=recurrence_kind,
             )
         )
     return drafts
@@ -813,7 +921,12 @@ def _format_task_draft_confirmation(creations, user_context_service: UserContext
     for index, draft in enumerate(creations[:10], start=1):
         reminder_time = draft.remind_at.astimezone(timezone).strftime("%d.%m %H:%M")
         repeat = draft.repeat_every_minutes or user_context_service.settings.default_repeat_minutes
+        recurrence = _format_recurrence_label(getattr(draft, "recurrence_kind", RecurrenceKind.NONE))
         lines.append(f"{index}. {draft.title} — {reminder_time}, повтор каждые {repeat} мин.")
+        if recurrence:
+            lines.append(f"   Тип: {recurrence}")
+        if getattr(draft, "description", None):
+            lines.append(f"   Комментарий: {draft.description}")
     lines.append("")
     lines.append("Добавить? Ответь «да», «нет» или напиши исправление.")
     return "\n".join(lines)
@@ -898,20 +1011,37 @@ async def _handle_task_management_intent(
     if message.from_user is None:
         return
 
+    message_text = message.text or ""
+
     if action == TaskAction.CANCEL_ALL:
-        cancelled = task_service.cancel_all_active_tasks(message.from_user.id)
+        cancelled, recurring_reminders = task_service.cancel_all_active_tasks(message.from_user.id)
+        for reminder in recurring_reminders:
+            reminder_scheduler.schedule_reminder(reminder)
         if cancelled == 0:
             await message.answer("Активных задач для отмены нет.", reply_markup=main_menu_keyboard())
         else:
             await message.answer(f"Окей, отменил активные задачи: {cancelled}.", reply_markup=main_menu_keyboard())
         return
 
-    task = user_context_service.latest_active_task(message.from_user.id)
-    if task is None:
+    tasks = task_service.list_tasks(message.from_user.id, limit=100)
+    if not tasks:
         await message.answer(
             "Не вижу активной задачи. Напиши ее прямо сюда: «надо сделать ...»",
             reply_markup=main_menu_keyboard(),
         )
+        return
+
+    task, resolution_error = _resolve_management_task(
+        message_text=message_text,
+        action=action,
+        tasks=tasks,
+        timezone=user_context_service.settings.tzinfo,
+    )
+    if resolution_error:
+        await message.answer(resolution_error, reply_markup=main_menu_keyboard())
+        return
+    if task is None:
+        await message.answer(_clarify_management_task_message(action), reply_markup=main_menu_keyboard())
         return
 
     try:
@@ -922,20 +1052,33 @@ async def _handle_task_management_intent(
             if focus_reminder:
                 reminder_scheduler.schedule_reminder(focus_reminder)
             text = await motivation_service.compose(message.from_user.id, AIScenario.FOCUS, task=updated)
-            await message.answer(escape(f"Старт зафиксировал.\n\n{text}"), reply_markup=main_menu_keyboard())
+            await message.answer(
+                escape(f"Старт зафиксировал: «{updated.title}».\n\n{text}"),
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         if action == TaskAction.DONE:
-            updated = task_service.complete_task(task.id, message.from_user.id)
-            text = await motivation_service.compose(message.from_user.id, AIScenario.COMPLETION, task=updated)
-            await message.answer(escape(f"Готово, закрыл задачу.\n\n{text}"), reply_markup=main_menu_keyboard())
+            updated, next_reminder = task_service.complete_task(task.id, message.from_user.id)
+            if next_reminder:
+                reminder_scheduler.schedule_reminder(next_reminder)
+            await message.answer(
+                escape(
+                    _format_completed_task_response(
+                        updated,
+                        next_reminder,
+                        user_context_service.settings.timezone,
+                    )
+                ),
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         if action == TaskAction.SNOOZE:
             postpone_minutes = minutes or user_context_service.settings.default_snooze_minutes
             updated, reminder = task_service.postpone_task(task.id, message.from_user.id, postpone_minutes)
             reminder_scheduler.schedule_reminder(reminder)
-            response = f"Окей, перенес на {postpone_minutes} мин."
+            response = f"Окей, перенес «{updated.title}» на {postpone_minutes} мин."
             if task_service.database.count_task_events(updated.id, "task_snoozed") >= 3:
                 push = await motivation_service.compose(
                     message.from_user.id,
@@ -949,7 +1092,10 @@ async def _handle_task_management_intent(
 
         if action == TaskAction.CANCEL:
             task_service.cancel_task(task.id, message.from_user.id)
-            await message.answer("Окей, отменил задачу.", reply_markup=main_menu_keyboard())
+            await message.answer(
+                escape(f"Окей, отменил задачу «{task.title}»."),
+                reply_markup=main_menu_keyboard(),
+            )
             return
     except InvalidTaskTransitionError:
         await message.answer(
@@ -970,6 +1116,271 @@ def _format_active_task_count(tasks) -> str:
     if len(tasks) > len(preview):
         lines.append(f"...и еще {len(tasks) - len(preview)}.")
     return "\n".join(lines)
+
+
+async def _handle_task_comment_update(
+    message: Message,
+    comment_update: tuple[str, str],
+    task_service: TaskService,
+) -> None:
+    if message.from_user is None:
+        return
+
+    target, description = comment_update
+    tasks = task_service.list_tasks(message.from_user.id, limit=100)
+    task = _find_task_by_title(tasks, target)
+    if task is None:
+        await message.answer(
+            escape(f"Не нашел активную задачу «{target}». Напиши «мои задачи» и выбери точное название."),
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    try:
+        updated = task_service.update_description(task.id, message.from_user.id, description)
+    except InvalidTaskTransitionError:
+        await message.answer("К закрытой задаче комментарий уже не добавляю.", reply_markup=main_menu_keyboard())
+        return
+
+    await message.answer(
+        escape(f"Окей, добавил комментарий к задаче «{updated.title}»:\n{updated.description}"),
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+def _parse_task_comment_request(text: str) -> tuple[str, str] | None:
+    cleaned = " ".join(text.strip().split())
+    patterns = [
+        r"(?i)^(?:добавь|добавить|запиши|сохрани|поставь)\s+(?:комментарий|коммент|описание|заметку)\s+(?:к|для)\s+(?:задач[еи]\s+)?(.+?)[,;:]?\s+(?:что|чтобы|:|-)\s+(.+)$",
+        r"(?i)^(?:к|для)\s+(?:задач[еи]\s+)?(.+?)\s+(?:комментарий|коммент|описание|заметка)[,;:]?\s*(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, cleaned)
+        if not match:
+            continue
+        target = match.group(1).strip(" .,!?:;—-")
+        description = match.group(2).strip(" .,!?:;—-")
+        if target and description:
+            return target[:255], description[:1000]
+    return None
+
+
+def _apply_description_to_drafts(drafts: list[SimpleNamespace], target: str, description: str) -> bool:
+    draft = _find_task_by_title(drafts, target)
+    if draft is None:
+        return False
+    draft.description = description[:1000]
+    return True
+
+
+def _find_task_by_title(items, target: str):
+    normalized_target = _normalize_match_text(target)
+    exact = [item for item in items if _normalize_match_text(item.title) == normalized_target]
+    if exact:
+        return exact[0]
+
+    partial = [
+        item
+        for item in items
+        if normalized_target in _normalize_match_text(item.title)
+        or _normalize_match_text(item.title) in normalized_target
+    ]
+    return partial[0] if len(partial) == 1 else None
+
+
+def _resolve_management_task(
+    message_text: str,
+    action: TaskAction,
+    tasks,
+    timezone: ZoneInfo,
+):
+    task_id = _extract_task_reference_id(message_text)
+    if task_id is not None:
+        for task in tasks:
+            if task.id == task_id:
+                return task, None
+        return None, f"Не нашел активную задачу #{task_id}. Напиши «Мои задачи», покажу актуальные номера."
+
+    title_matches = _find_tasks_mentioned_in_text(tasks, message_text)
+    schedule_matches = _filter_tasks_by_schedule_hint(tasks, message_text, timezone)
+
+    if title_matches:
+        schedule_title_matches = _filter_tasks_by_schedule_hint(title_matches, message_text, timezone)
+        if len(schedule_title_matches) == 1:
+            return schedule_title_matches[0], None
+        if len(title_matches) == 1:
+            return title_matches[0], None
+        return None, _clarify_management_task_message(action)
+
+    if schedule_matches:
+        if len(schedule_matches) == 1:
+            return schedule_matches[0], None
+        return None, _clarify_management_task_message(action)
+
+    fallback = _default_management_task(tasks, action)
+    return fallback, None
+
+
+def _find_tasks_mentioned_in_text(tasks, message_text: str):
+    normalized_message = f" {_normalize_match_text(message_text)} "
+    matched = []
+    for task in tasks:
+        normalized_title = _normalize_match_text(task.title)
+        if not normalized_title:
+            continue
+        if f" {normalized_title} " in normalized_message:
+            matched.append(task)
+            continue
+
+        title_tokens = [token for token in normalized_title.split() if len(token) >= 3]
+        if len(title_tokens) >= 2 and all(f" {token} " in normalized_message for token in title_tokens):
+            matched.append(task)
+    return matched
+
+
+def _filter_tasks_by_schedule_hint(tasks, message_text: str, timezone: ZoneInfo):
+    schedule_hint = _extract_management_schedule_hint(message_text, timezone)
+    if schedule_hint is None:
+        return []
+
+    target_date, hour, minute = schedule_hint
+    matched = []
+    for task in tasks:
+        local_start = task.start_reminder_at.astimezone(timezone)
+        if hour is not None and minute is not None and (local_start.hour != hour or local_start.minute != minute):
+            continue
+        if target_date is not None and local_start.date() != target_date:
+            continue
+        matched.append(task)
+    return matched
+
+
+def _extract_management_schedule_hint(message_text: str, timezone: ZoneInfo):
+    normalized = " ".join(message_text.strip().lower().replace("ё", "е").split())
+    if not normalized:
+        return None
+
+    hour = minute = None
+    time_patterns = (
+        r"\bв\s+(\d{1,2})[:.](\d{2})\b",
+        r"\bв\s+(\d{1,2})\s+(\d{2})\b",
+        r"\b(\d{1,2})[:.](\d{2})\b",
+    )
+    for pattern in time_patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        break
+
+    if hour is None or minute is None:
+        meridiem_match = re.search(r"\bв\s+(\d{1,2})\s*(утра|дня|вечера|ночи)\b", normalized)
+        if meridiem_match:
+            hour = int(meridiem_match.group(1))
+            minute = 0
+            meridiem = meridiem_match.group(2)
+            if meridiem in {"дня", "вечера"} and 1 <= hour <= 11:
+                hour += 12
+            elif meridiem == "ночи" and hour == 12:
+                hour = 0
+
+    if hour is not None and not 0 <= hour <= 23:
+        return None
+    if minute is not None and not 0 <= minute <= 59:
+        return None
+
+    local_now = utc_now().astimezone(timezone)
+    target_date = None
+    if "сегодня" in normalized:
+        target_date = local_now.date()
+    elif "завтра" in normalized:
+        target_date = local_now.date() + timedelta(days=1)
+    else:
+        date_match = re.search(r"\b(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\b", normalized)
+        if date_match:
+            day = int(date_match.group(1))
+            month = int(date_match.group(2))
+            year = int(date_match.group(3) or local_now.year)
+            try:
+                target_date = datetime(year, month, day, tzinfo=timezone).date()
+            except ValueError:
+                target_date = None
+
+    if target_date is None and hour is None and minute is None:
+        return None
+    return target_date, hour, minute
+
+
+def _default_management_task(tasks, action: TaskAction):
+    if len(tasks) == 1:
+        return tasks[0]
+
+    if action == TaskAction.DONE:
+        in_progress = [task for task in tasks if task.status == TaskStatus.IN_PROGRESS]
+        if len(in_progress) == 1:
+            return in_progress[0]
+        return None
+
+    if action in {TaskAction.START, TaskAction.SNOOZE}:
+        actionable = [task for task in tasks if task.status in {TaskStatus.PENDING, TaskStatus.NUDGING, TaskStatus.SNOOZED}]
+        return actionable[0] if len(actionable) == 1 else None
+
+    if action == TaskAction.CANCEL:
+        cancellable = [task for task in tasks if task.status not in {TaskStatus.DONE, TaskStatus.CANCELLED}]
+        return cancellable[0] if len(cancellable) == 1 else None
+
+    return None
+
+
+def _clarify_management_task_message(action: TaskAction) -> str:
+    action_text = {
+        TaskAction.START: "запустить",
+        TaskAction.DONE: "отметить выполненной",
+        TaskAction.SNOOZE: "перенести",
+        TaskAction.CANCEL: "отменить",
+    }.get(action, "изменить")
+    return (
+        f"Понял действие, но не понял, какую именно задачу нужно {action_text}. "
+        "Напиши название, время или номер из «Мои задачи»."
+    )
+
+
+def _format_completed_task_response(task, next_reminder, timezone_name: str) -> str:
+    lines = [f"Готово, отметил выполненной: {task.title}."]
+    if task.recurrence_kind != RecurrenceKind.NONE:
+        if next_reminder is not None:
+            next_time = next_reminder.scheduled_at.astimezone(ZoneInfo(timezone_name)).strftime("%d.%m %H:%M")
+            lines.append(f"Следующее повторение: {next_time}.")
+        else:
+            lines.append("Следующее повторение уже стоит в расписании.")
+    return "\n".join(lines)
+
+
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]+", " ", value.lower().replace("ё", "е")).strip()
+
+
+def _clean_optional_text(value) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).strip().split())
+    return cleaned[:1000] if cleaned else None
+
+
+def _parse_recurrence_kind_value(value) -> RecurrenceKind:
+    try:
+        return RecurrenceKind(str(value).strip().lower())
+    except ValueError:
+        return RecurrenceKind.NONE
+
+
+def _format_recurrence_label(recurrence_kind: RecurrenceKind) -> str | None:
+    if recurrence_kind == RecurrenceKind.DAILY:
+        return "Ежедневная"
+    if recurrence_kind == RecurrenceKind.WEEKLY:
+        return "Еженедельная"
+    return None
 
 
 def _build_classifier_context(recent_dialog: list[tuple[str, str]]) -> str:
@@ -993,6 +1404,29 @@ def _is_internal_ai_prompt(value: str) -> bool:
             "прошла минута после мотивационного трека",
             "пользователь уже получил первое напоминание",
         )
+    )
+
+
+def _log_local_media_interaction(
+    task_service: TaskService,
+    telegram_user_id: int,
+    user_message: str,
+    track: MotivationalTrack | None,
+) -> None:
+    response = (
+        "Отправил мотивационный файл из media/boosts/focus."
+        if track is not None and track.file_path
+        else "Пользователь попросил мотивационный файл, но локальный файл не найден."
+    )
+    task_service.database.add_ai_interaction(
+        telegram_user_id=telegram_user_id,
+        task_id=None,
+        scenario=AIScenario.BOOST.value,
+        tone_mode=ToneMode.BRO.value,
+        provider="local:media",
+        user_message=user_message,
+        prompt=None,
+        response=response,
     )
 
 
@@ -1155,11 +1589,58 @@ def _schedule_energy_followup(
     )
 
 
-def _asks_for_motivation_media(text: str) -> bool:
+def _asks_for_motivation_media(text: str, conversation_context: str | None = None) -> bool:
     normalized = " ".join(text.strip().lower().split())
-    action_words = ["кинь", "скинь", "дай", "пришли", "отправь", "можешь кинуть", "можешь скинуть"]
+    action_words = [
+        "кинь",
+        "скинь",
+        "дай",
+        "давай",
+        "пришли",
+        "отправь",
+        "можешь кинуть",
+        "можешь скинуть",
+    ]
     media_words = ["трек", "видос", "видосик", "видео", "ролик", "буст"]
-    return any(word in normalized for word in action_words) and any(word in normalized for word in media_words)
+    repeat_words = [
+        "еще",
+        "ещё",
+        "еще один",
+        "ещё один",
+        "еще раз",
+        "ещё раз",
+        "другой",
+        "другую",
+        "следующий",
+        "следующее",
+        "новый",
+        "новое",
+    ]
+    has_media = any(word in normalized for word in media_words)
+    has_action = any(word in normalized for word in action_words)
+    has_repeat = any(word in normalized for word in repeat_words)
+    if has_media and (has_action or has_repeat):
+        return True
+    return has_repeat and _recent_context_mentions_media(conversation_context)
+
+
+def _recent_context_mentions_media(conversation_context: str | None) -> bool:
+    if not conversation_context:
+        return False
+    normalized = conversation_context.lower()
+    return any(
+        phrase in normalized
+        for phrase in [
+            "мотивационный файл",
+            "трек для мотивации",
+            "кинь видос",
+            "скинь видос",
+            "видосик",
+            "видео",
+            "ролик",
+            "local:media",
+        ]
+    )
 
 
 def _parse_ai_action(data: str | None) -> tuple[str | None, int | None]:

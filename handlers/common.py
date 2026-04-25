@@ -7,6 +7,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import ErrorEvent, Message
 
+from handlers.text_utils import matches_user_text
 from keyboards.reply import main_menu_keyboard
 from scheduler import ReminderScheduler
 from services.task_service import TaskService
@@ -51,7 +52,7 @@ async def start(message: Message, state: FSMContext, task_service: TaskService) 
 
 
 @router.message(Command("help"))
-@router.message(lambda message: message.text == "Помощь")
+@router.message(lambda message: matches_user_text(message.text, "Помощь"))
 async def help_command(message: Message) -> None:
     await message.answer(HELP_TEXT, reply_markup=main_menu_keyboard())
 

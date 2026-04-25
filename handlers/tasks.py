@@ -10,6 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 from config import Settings
+from handlers.text_utils import matches_user_text
 from keyboards.inline import quick_add_keyboard, task_actions_keyboard, task_list_keyboard
 from keyboards.reply import (
     interval_keyboard,
@@ -23,6 +24,7 @@ from services.motivation_service import MotivationService
 from scheduler import ReminderScheduler
 from services.formatting import (
     format_active_reminders,
+    format_task_already_exists,
     format_task_created,
     format_task_details,
     format_task_list,
@@ -51,7 +53,7 @@ class QuickTask(StatesGroup):
 
 
 @router.message(Command("add"))
-@router.message(lambda message: message.text == "Добавить задачу")
+@router.message(lambda message: matches_user_text(message.text, "Добавить задачу"))
 async def start_add_task(message: Message, state: FSMContext, task_service: TaskService) -> None:
     if message.from_user:
         task_service.ensure_user(message.from_user, message.chat.id)
@@ -133,7 +135,7 @@ async def add_priority(
         return
 
     task_service.ensure_user(message.from_user, message.chat.id)
-    task, reminder = task_service.create_task(
+    creation = task_service.create_task(
         telegram_user_id=message.from_user.id,
         chat_id=message.chat.id,
         title=data["title"],
@@ -142,13 +144,20 @@ async def add_priority(
         repeat_every_minutes=data["interval"],
         priority=priority,
     )
-    reminder_scheduler.schedule_reminder(reminder)
+    reminder_scheduler.schedule_reminder(creation.reminder)
     await state.clear()
-    await message.answer(format_task_created(task, settings.timezone), reply_markup=main_menu_keyboard())
+    await message.answer(
+        (
+            format_task_created(creation.task, settings.timezone)
+            if creation.created_new
+            else format_task_already_exists(creation.task, settings.timezone)
+        ),
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 @router.message(Command("tasks"))
-@router.message(lambda message: message.text == "Мои задачи")
+@router.message(lambda message: matches_user_text(message.text, "Мои задачи"))
 async def show_tasks(message: Message, task_service: TaskService, settings: Settings) -> None:
     if message.from_user is None:
         return
@@ -166,7 +175,7 @@ async def show_tasks(message: Message, task_service: TaskService, settings: Sett
 
 
 @router.message(Command("history"))
-@router.message(lambda message: message.text == "История задач")
+@router.message(lambda message: matches_user_text(message.text, "История задач"))
 async def show_task_history(message: Message, task_service: TaskService, settings: Settings) -> None:
     if message.from_user is None:
         return
@@ -184,7 +193,7 @@ async def show_task_history(message: Message, task_service: TaskService, setting
 
 
 @router.message(Command("active"))
-@router.message(lambda message: message.text == "Активные напоминания")
+@router.message(lambda message: matches_user_text(message.text, "Активные напоминания"))
 async def show_active_reminders(message: Message, task_service: TaskService, settings: Settings) -> None:
     if message.from_user is None:
         return
@@ -312,6 +321,7 @@ async def snooze_task_callback(
 async def complete_task_callback(
     callback: CallbackQuery,
     task_service: TaskService,
+    reminder_scheduler: ReminderScheduler,
     settings: Settings,
     motivation_service: MotivationService,
 ) -> None:
@@ -321,7 +331,7 @@ async def complete_task_callback(
         return
 
     try:
-        task = task_service.complete_task(task_id, callback.from_user.id)
+        task, next_reminder = task_service.complete_task(task_id, callback.from_user.id)
     except TaskNotFoundError:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
@@ -329,10 +339,18 @@ async def complete_task_callback(
         await callback.answer(str(exc), show_alert=True)
         return
 
+    if next_reminder:
+        reminder_scheduler.schedule_reminder(next_reminder)
     await _safe_edit(callback, format_task_details(task, settings.timezone), task_actions_keyboard(task))
     if callback.message and motivation_service.should_send_proactive(callback.from_user.id):
         text = await motivation_service.compose(callback.from_user.id, AIScenario.COMPLETION, task=task)
         await callback.message.answer(escape(text))
+    if next_reminder:
+        await callback.answer("Next recurring task is already scheduled.")
+        return
+    if next_reminder:
+        await callback.answer("Р—Р°РґР°С‡Р° Р·Р°РІРµСЂС€РµРЅР°; СЃР»РµРґСѓСЋС‰РµРµ РїРѕРІС‚РѕСЂРµРЅРёРµ СѓР¶Рµ Р·Р°РїР»Р°РЅРёСЂРѕРІР°РЅРѕ.")
+        return
     await callback.answer("Задача завершена.")
 
 
@@ -344,7 +362,7 @@ async def cancel_task_callback(callback: CallbackQuery, task_service: TaskServic
         return
 
     try:
-        task = task_service.cancel_task(task_id, callback.from_user.id)
+        task, _ = task_service.cancel_task(task_id, callback.from_user.id)
     except TaskNotFoundError:
         await callback.answer("Задача не найдена.", show_alert=True)
         return
@@ -446,7 +464,7 @@ async def save_quick_task(
         return
 
     task_service.ensure_user(callback.from_user, callback.message.chat.id)
-    task, reminder = task_service.create_task(
+    creation = task_service.create_task(
         telegram_user_id=callback.from_user.id,
         chat_id=callback.message.chat.id,
         title=title,
@@ -455,10 +473,18 @@ async def save_quick_task(
         repeat_every_minutes=settings.default_repeat_minutes,
         priority=Priority.MEDIUM,
     )
-    reminder_scheduler.schedule_reminder(reminder)
+    reminder_scheduler.schedule_reminder(creation.reminder)
     await state.clear()
-    await _safe_edit(callback, format_task_created(task, settings.timezone), None)
-    await callback.answer("Задача сохранена.")
+    await _safe_edit(
+        callback,
+        (
+            format_task_created(creation.task, settings.timezone)
+            if creation.created_new
+            else format_task_already_exists(creation.task, settings.timezone)
+        ),
+        None,
+    )
+    await callback.answer("Задача сохранена." if creation.created_new else "Такая задача уже есть.")
 
 
 @router.callback_query(F.data == "quick:ignore")
@@ -478,7 +504,8 @@ async def replace_quick_task(message: Message, state: FSMContext) -> None:
     await message.answer("Сохранить это как задачу с напоминанием сейчас?", reply_markup=quick_add_keyboard())
 
 
-@router.message(F.text)
+# Freeform text is handled by handlers.ai; keep legacy quick-add callbacks only for old messages.
+@router.message(F.text, lambda _message: False)
 async def plain_text_task(
     message: Message,
     state: FSMContext,
@@ -495,7 +522,7 @@ async def plain_text_task(
     task_service.ensure_user(message.from_user, message.chat.id)
     parsed = parse_natural_reminder(text, utc_now(), settings.tzinfo)
     if parsed:
-        task, reminder = task_service.create_task(
+        creation = task_service.create_task(
             telegram_user_id=message.from_user.id,
             chat_id=message.chat.id,
             title=parsed.title,
@@ -504,9 +531,16 @@ async def plain_text_task(
             repeat_every_minutes=settings.default_repeat_minutes,
             priority=Priority.MEDIUM,
         )
-        reminder_scheduler.schedule_reminder(reminder)
+        reminder_scheduler.schedule_reminder(creation.reminder)
         await state.clear()
-        await message.answer(format_task_created(task, settings.timezone), reply_markup=main_menu_keyboard())
+        await message.answer(
+            (
+                format_task_created(creation.task, settings.timezone)
+                if creation.created_new
+                else format_task_already_exists(creation.task, settings.timezone)
+            ),
+            reply_markup=main_menu_keyboard(),
+        )
         return
 
     await state.set_state(QuickTask.confirm)

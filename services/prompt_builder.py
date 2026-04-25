@@ -27,6 +27,11 @@ SYSTEM_PROMPT = """
 - иногда можно сказать "брат"
 - трек упоминай только если пользователь прямо просит трек/видос/буст или если в промте явно сказано, что трек будет ниже
 - если пользователь просто разговаривает или отвечает на твой вопрос, продолжай диалог как нормальный собеседник
+- не долби одним и тем же советом. Если уже говорил "встань", "вода", "разомнись", не повторяй это без прямой причины
+- если пользователь пишет "спасибо", "да, вернулся", "стало лучше", "понял", сначала нормально отреагируй на это, а не начинай новый дожим
+- всегда учитывай время задачи. Если задача запланирована на будущее, не говори делать ее прямо сейчас
+- если пользователь просит план на день, расставляй задачи по их времени напоминания и говори, что делать сейчас только если задача уже актуальна
+- если задача стоит на завтра или другой будущий день, не включай ее как действие на сегодня; можно написать, что она запланирована позже
 - не выдумывай детали, которых нет в контексте
 
 Ограничения:
@@ -47,6 +52,32 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
+GENERAL_CHAT_SYSTEM_PROMPT = """
+You are a natural Russian-speaking chat companion inside a Telegram bot.
+Sound like a real person, not like a productivity dashboard.
+
+Core behavior:
+- if the user wants to talk, listen first;
+- do not drag every message back to tasks;
+- answer warmly, simply, and like a normal human;
+- one natural follow-up question is better than a checklist;
+- no coaching jargon, no canned motivation, no robotic tone.
+""".strip()
+
+
+SUPPORT_SYSTEM_PROMPT = """
+You are a calm, human, Russian-speaking supportive companion.
+The user may be tired, overloaded, or just wants to be heard.
+
+Core behavior:
+- start by acknowledging the feeling in plain language;
+- do not jump straight into lists, schedules, or lectures;
+- do not push tasks unless the user explicitly asks for that;
+- if you suggest something, keep it optional and very small;
+- sounding heard matters more than sounding productive.
+""".strip()
+
+
 PromptMessage = dict[str, str]
 
 
@@ -63,6 +94,12 @@ class PromptBuilder:
 
         about_task_list = _asks_about_task_list(user_text)
         low_energy = _is_low_energy_message(user_text)
+        plain_chat = scenario == AIScenario.GENERAL_CHAT
+        hide_task_context = _should_hide_task_context(
+            scenario=scenario,
+            low_energy=low_energy,
+            about_task_list=about_task_list,
+        )
         repeat_start_reminder = _is_repeat_start_reminder(user_text)
         energy_followup = _is_energy_followup(user_text)
         bro_boost = context.bro_boost_allowed and scenario in {
@@ -71,6 +108,11 @@ class PromptBuilder:
             AIScenario.PANIC,
             AIScenario.BOOST,
         }
+        system_prompt = _select_system_prompt(
+            scenario=scenario,
+            low_energy=low_energy,
+            about_task_list=about_task_list,
+        )
 
         style_note = self._build_style_note(
             bro_boost=bro_boost,
@@ -79,17 +121,17 @@ class PromptBuilder:
             scenario=scenario,
         )
 
-        task_summary = _format_task_summary(context)
-        active_tasks = _format_active_tasks_short(context)
-        recent_user_messages = _format_recent_user_messages(context)
-        goals = _format_goals(context)
-        motives = _format_motives(context)
+        task_summary = _format_task_summary(context) if not hide_task_context else "hidden for this reply"
+        active_tasks = _format_active_tasks_short(context) if not hide_task_context else "hidden for this reply"
+        recent_dialog = _format_recent_dialog(context, include_assistant=not hide_task_context)
+        goals = _format_goals(context) if not hide_task_context else "not relevant for this reply"
+        motives = _format_motives(context) if not hide_task_context else "not relevant for this reply"
         plan_text = f"{plan_minutes} минут" if plan_minutes else "не нужен"
 
         user_prompt = "\n".join(
             [
                 f"Сценарий: {scenario.value}",
-                f"Локальное время: {context.local_now.strftime('%H:%M')}",
+                f"Локальная дата и время: {context.local_now.strftime('%d.%m.%Y %H:%M')}",
                 f"Предпочтительный тон: {context.effective_tone.value}",
                 f"Стиль ответа: {style_note}",
                 f"Сегодня завершено задач: {context.completed_today}",
@@ -99,7 +141,7 @@ class PromptBuilder:
                 f"Причины / ради чего: {motives}",
                 f"Текущая задача: {task_summary}",
                 f"Ближайшие активные задачи:\n{active_tasks}",
-                f"Недавние сообщения пользователя:\n{recent_user_messages}",
+                f"Недавний диалог:\n{recent_dialog}",
                 "",
                 f"Сообщение пользователя: {user_text}",
                 "",
@@ -107,6 +149,8 @@ class PromptBuilder:
                     scenario=scenario,
                     has_task=task is not None,
                     about_task_list=about_task_list,
+                    low_energy=low_energy,
+                    plain_chat=plain_chat,
                     bro_boost=bro_boost,
                     repeat_start_reminder=repeat_start_reminder,
                     energy_followup=energy_followup,
@@ -115,7 +159,7 @@ class PromptBuilder:
         )
 
         return [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
@@ -137,14 +181,15 @@ class PromptBuilder:
 
         if low_energy:
             return (
-                "мягкий режим: коротко показать, что понимаешь состояние, "
-                "а потом вернуть к одному маленькому действию."
+                "мягкий режим: сначала по-человечески признать состояние и дать почувствовать, что пользователя услышали. "
+                "Не скатывайся сразу в инструкцию. Один мягкий вопрос или одно очень маленькое предложение помощи лучше, чем список действий."
             )
 
         if about_task_list:
             return (
                 "собранный режим: коротко разобрать список задач, "
-                "помочь расставить порядок и дать ближайший старт."
+                "помочь расставить порядок по времени. Если ближайшая задача запланирована позже, "
+                "не заставляй делать ее сейчас; предложи подготовку или свободный слот до нее."
             )
 
         if scenario == AIScenario.GENERAL_CHAT:
@@ -156,21 +201,63 @@ class PromptBuilder:
         return "обычный рабочий режим: коротко, естественно, по делу."
 
 
+def _select_system_prompt(
+    *,
+    scenario: AIScenario,
+    low_energy: bool,
+    about_task_list: bool,
+) -> str:
+    if scenario == AIScenario.GENERAL_CHAT:
+        return GENERAL_CHAT_SYSTEM_PROMPT
+    if low_energy and not about_task_list:
+        return SUPPORT_SYSTEM_PROMPT
+    if scenario in {AIScenario.COMEBACK, AIScenario.PANIC} and not about_task_list:
+        return SUPPORT_SYSTEM_PROMPT
+    return SYSTEM_PROMPT
+
+
+def _should_hide_task_context(
+    *,
+    scenario: AIScenario,
+    low_energy: bool,
+    about_task_list: bool,
+) -> bool:
+    if about_task_list:
+        return False
+    if scenario == AIScenario.GENERAL_CHAT:
+        return True
+    if low_energy:
+        return True
+    return scenario in {AIScenario.COMEBACK, AIScenario.PANIC, AIScenario.PROCRASTINATION}
+
+
 def _build_final_instruction(
     *,
     scenario: AIScenario,
     has_task: bool,
     about_task_list: bool,
+    low_energy: bool,
+    plain_chat: bool,
     bro_boost: bool,
     repeat_start_reminder: bool,
     energy_followup: bool,
 ) -> str:
-    if scenario == AIScenario.GENERAL_CHAT:
+    if plain_chat:
         return (
-            "Ответь прямо на сообщение пользователя. "
-            "Если это обычный чат, не уводи разговор в задачи и продуктивность без запроса. "
-            "Если пользователь отвечает на твой предыдущий вопрос, продолжи именно эту ветку диалога. "
-            "Не предлагай трек и не запускай мотивационный режим без явной просьбы."
+            "Reply like a normal human in Russian. "
+            "Do not drag this reply back to tasks or productivity unless the user explicitly asks. "
+            "If the user wants to talk, listen first. "
+            "A warm natural response or one gentle follow-up question is enough. "
+            "Do not mention plans, reminders, tracks, backend, OpenAI, or settings."
+        )
+
+    if low_energy and not about_task_list:
+        return (
+            "The user sounds tired, overloaded, or emotionally done. "
+            "Start by acknowledging that state in plain human language. "
+            "Do not jump into a checklist, schedule, or lecture. "
+            "Do not list tasks from context unless the user explicitly asks. "
+            "If helpful, offer one optional tiny suggestion or one gentle follow-up question, not both."
         )
 
     if bro_boost:
@@ -208,19 +295,23 @@ def _build_final_instruction(
         return (
             "Разбери именно список задач из контекста. "
             "Не зацикливайся на одной последней задаче. "
-            "Дай короткий порядок и ближайший старт."
+            "Дай короткий порядок по времени напоминаний. "
+            "Не предлагай делать сейчас задачу, которая запланирована на будущее. "
+            "Если пользователь просит план на сегодня, задачи на завтра пометь отдельно, а не ставь их в текущий план."
         )
 
     if has_task:
         return (
             "Если вопрос относится к текущей задаче, отвечай именно по ней. "
+            "Если время этой задачи еще не пришло, не заставляй стартовать сейчас; предложи подготовку или скажи, когда к ней вернуться. "
             "Не выдумывай детали, которых нет. "
             "Если информации мало, дай универсальный первый шаг."
         )
 
     return (
-        "Ответь коротко и практично. "
-        "Если человек завис, верни его к одному маленькому действию."
+        "Ответь на конкретное сообщение пользователя, учитывая недавний диалог. "
+        "Если человек завис, верни его к одному маленькому действию, но не повторяй одинаковые советы. "
+        "Если задача запланирована на будущее, не говори делать ее прямо сейчас."
     )
 
 
@@ -237,6 +328,7 @@ def _format_task_summary(context: UserAIContext) -> str:
         task.title,
         f"статус={task.status.value}",
         f"приоритет={task.priority.value}",
+        _format_task_timing(task, context.local_now),
     ]
 
     if task.description:
@@ -251,28 +343,70 @@ def _format_task_summary(context: UserAIContext) -> str:
     return "; ".join(parts)
 
 
+def _format_task_timing(task, local_now) -> str:
+    reminder_local = task.start_reminder_at.astimezone(local_now.tzinfo)
+    reminder_text = reminder_local.strftime("%d.%m %H:%M")
+    day_text = _format_schedule_day(reminder_local, local_now)
+
+    if task.status.value == "in_progress":
+        return f"время={reminder_text} ({day_text}); уже начата"
+
+    delta_seconds = int((reminder_local - local_now).total_seconds())
+    if delta_seconds > 60:
+        return f"время={reminder_text} ({day_text}); запланирована на будущее; осталось {_format_duration(delta_seconds)}"
+    if delta_seconds < -60:
+        return f"время={reminder_text} ({day_text}); время уже прошло; просрочено на {_format_duration(abs(delta_seconds))}"
+    return f"время={reminder_text} ({day_text}); актуальна сейчас"
+
+
+def _format_schedule_day(reminder_local, local_now) -> str:
+    days = (reminder_local.date() - local_now.date()).days
+    if days == 0:
+        return "сегодня"
+    if days == 1:
+        return "завтра"
+    if days == -1:
+        return "вчера"
+    if days > 1:
+        return f"через {days} дн"
+    return f"{abs(days)} дн назад"
+
+
+def _format_duration(seconds: int) -> str:
+    minutes = max(1, round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, rest = divmod(minutes, 60)
+    if rest == 0:
+        return f"{hours} ч"
+    return f"{hours} ч {rest} мин"
+
+
 def _format_active_tasks_short(context: UserAIContext) -> str:
     if not context.active_tasks:
         return "нет"
 
     lines = []
-    for task in context.active_tasks[:3]:
+    for task in context.active_tasks[:10]:
         marker = "текущая" if context.task is not None and task.id == context.task.id else "активная"
         lines.append(
             f"- {task.title} ({marker}) "
-            f"(статус={task.status.value}, приоритет={task.priority.value})"
+            f"(статус={task.status.value}, приоритет={task.priority.value}, "
+            f"{_format_task_timing(task, context.local_now)})"
         )
     return "\n".join(lines)
 
 
-def _format_recent_user_messages(context: UserAIContext) -> str:
+def _format_recent_dialog(context: UserAIContext, include_assistant: bool = True) -> str:
     if not context.recent_dialog:
         return "нет"
 
     lines = []
     for user_text, _assistant_text in context.recent_dialog[-4:]:
         if user_text:
-            lines.append(f"- {_clean(user_text)[:250]}")
+            lines.append(f"Пользователь: {_clean(user_text)[:250]}")
+        if include_assistant and _assistant_text:
+            lines.append(f"Ассистент: {_clean(_assistant_text)[:350]}")
     return "\n".join(lines) if lines else "нет"
 
 

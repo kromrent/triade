@@ -12,6 +12,14 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def confirm_yes_no_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Да"), KeyboardButton(text="Нет")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def skip_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Пропустить")]],

@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 from enum import Enum
 from zoneinfo import ZoneInfo
 
-from models import AIScenario
+from models import AIScenario, RecurrenceKind
 from services.parser import ParsedReminder, TimeParseError, parse_natural_reminder, parse_time_input
 
 
@@ -44,6 +44,7 @@ class Intent:
     scenario: AIScenario | None = None
     task_title: str | None = None
     reminder_at: datetime | None = None
+    recurrence_kind: RecurrenceKind | None = None
     action: TaskAction | None = None
     query: TaskQuery | None = None
     minutes: int | None = None
@@ -56,7 +57,86 @@ class Intent:
 class ParsedTaskCreation:
     title: str
     remind_at: datetime
+    recurrence_kind: RecurrenceKind = RecurrenceKind.NONE
     repeat_every_minutes: int | None = None
+    description: str | None = None
+
+
+DAILY_RECURRENCE_RE = (
+    "(?:"
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\\w*|"
+    "\u043a\u0430\u0436\u0434\u044b\u0439\\s+\u0434\u0435\u043d\u044c|"
+    "\u043a\u0430\u0436\u0434\u043e\u0435\\s+\u0443\u0442\u0440\u043e|"
+    "\u043a\u0430\u0436\u0434\u044b\u0439\\s+\u0432\u0435\u0447\u0435\u0440"
+    ")"
+)
+
+WEEKLY_RECURRENCE_RE = (
+    "(?:"
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\\w*|"
+    "\u043a\u0430\u0436\u0434\u0443\u044e\\s+\u043d\u0435\u0434\u0435\u043b\u044e"
+    ")"
+)
+
+RECURRENCE_PHRASES_RE = f"(?:{DAILY_RECURRENCE_RE}|{WEEKLY_RECURRENCE_RE})"
+TASK_CREATION_MODIFIER_RE = (
+    "(?:"
+    "\u0435\u0449\u0435|"
+    "\u0435\u0449\u0451|"
+    "\u043d\u043e\u0432\u0443\u044e|"
+    "\u043d\u043e\u0432\u043e\u0435|"
+    "\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0443\u044e|"
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\\w*|"
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\\w*|"
+    "\u043f\u043e\u0432\u0442\u043e\u0440\u044f\u044e\u0449\\w*"
+    ")"
+)
+TASK_NOUN_RE = "(?:\u0437\u0430\u0434\u0430\u0447[\u0430\u0443\u0438]?|\u0434\u0435\u043b\u043e|\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d(?:\u0438\u0435|\u0438\u044f|\u0438\u044e)?)"
+EXPLICIT_DAY_HINT_RE = (
+    "(?:"
+    "\u0441\u0435\u0433\u043e\u0434\u043d\u044f|"
+    "\u0441\u0435\u0433\u043e\u0434\u043d\u044f\u0448\u043d\u0435\u0433\u043e\\s+\u0434\u043d\u044f|"
+    "\u0437\u0430\u0432\u0442\u0440\u0430"
+    ")"
+)
+
+FUZZY_CREATE_VERBS = (
+    "\u0434\u043e\u0431\u0430\u0432\u044c",
+    "\u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c",
+    "\u0441\u043e\u0437\u0434\u0430\u0439",
+    "\u0441\u043e\u0437\u0434\u0430\u0442\u044c",
+    "\u0437\u0430\u043f\u0438\u0448\u0438",
+    "\u043f\u043e\u0441\u0442\u0430\u0432\u044c",
+    "\u043f\u043e\u0441\u0442\u0430\u0432\u0438\u0442\u044c",
+    "\u043d\u0430\u043f\u043e\u043c\u043d\u0438",
+    "\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u0442\u044c",
+)
+
+FUZZY_TASK_NOUNS = (
+    "\u0437\u0430\u0434\u0430\u0447\u0430",
+    "\u0437\u0430\u0434\u0430\u0447\u0443",
+    "\u0437\u0430\u0434\u0430\u0447\u0438",
+    "\u0434\u0435\u043b\u043e",
+    "\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u0435",
+    "\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u044f",
+    "\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u044e",
+)
+
+FUZZY_DAILY_RECURRENCE_WORDS = (
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u043e",
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u0430\u044f",
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u0443\u044e",
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u044b\u0439",
+    "\u0435\u0436\u0435\u0434\u043d\u0435\u0432\u043d\u043e\u0435",
+)
+
+FUZZY_WEEKLY_RECURRENCE_WORDS = (
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u043e",
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0430\u044f",
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u0443\u044e",
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u044b\u0439",
+    "\u0435\u0436\u0435\u043d\u0435\u0434\u0435\u043b\u044c\u043d\u043e\u0435",
+)
 
 
 class IntentService:
@@ -67,16 +147,29 @@ class IntentService:
         timezone: ZoneInfo,
         ai_service: object | None = None,
         conversation_context: str | None = None,
+        use_ai_classifier: bool = True,
     ) -> Intent:
-        normalized = _normalize(text)
+        normalized = _normalize_intent_text(text)
         if not normalized:
             return Intent(IntentType.UNKNOWN, 0.0, user_message=text)
 
         create_signal = _has_create_task_signal(normalized) or _looks_like_schedule_plan(normalized)
+        if _prefers_plain_chat(normalized) and not create_signal:
+            return Intent(IntentType.GENERAL_CHAT, 0.94, scenario=AIScenario.GENERAL_CHAT, user_message=text)
+
+        support_scenario = _detect_support_scenario(normalized)
+        if support_scenario is not None and not create_signal:
+            return Intent(
+                _support_intent_type(support_scenario),
+                0.93,
+                scenario=support_scenario,
+                user_message=text,
+            )
+
         if _is_low_energy_state(normalized) and not create_signal:
             return Intent(IntentType.EMOTIONAL_STATE, 0.92, scenario=AIScenario.COMEBACK, user_message=text)
 
-        classifier = getattr(ai_service, "classify_intent", None)
+        classifier = getattr(ai_service, "classify_intent", None) if use_ai_classifier else None
         if classifier is not None:
             payload = await classifier(text, now.astimezone(timezone), str(timezone), conversation_context)
             ai_intent = _intent_from_ai_payload(payload, text, now, timezone)
@@ -117,7 +210,7 @@ class IntentService:
         return self.detect(text, now, timezone)
 
     def detect(self, text: str, now: datetime, timezone: ZoneInfo) -> Intent:
-        normalized = _normalize(text)
+        normalized = _normalize_intent_text(text)
         if not normalized:
             return Intent(IntentType.UNKNOWN, 0.0, user_message=text)
 
@@ -131,10 +224,6 @@ class IntentService:
                 user_message=text,
             )
 
-        task_advice = _detect_task_advice_query(normalized)
-        if task_advice:
-            return Intent(IntentType.TASK_HELP, 0.9, scenario=task_advice, user_message=text)
-
         task_query = _detect_task_query(normalized)
         if task_query:
             return Intent(
@@ -143,6 +232,22 @@ class IntentService:
                 query=task_query,
                 user_message=text,
             )
+
+        if _prefers_plain_chat(normalized):
+            return Intent(IntentType.GENERAL_CHAT, 0.9, scenario=AIScenario.GENERAL_CHAT, user_message=text)
+
+        support_scenario = _detect_support_scenario(normalized)
+        if support_scenario is not None:
+            return Intent(
+                _support_intent_type(support_scenario),
+                0.9,
+                scenario=support_scenario,
+                user_message=text,
+            )
+
+        task_advice = _detect_task_advice_query(normalized)
+        if task_advice:
+            return Intent(IntentType.TASK_HELP, 0.9, scenario=task_advice, user_message=text)
 
         if _is_emotional_state(normalized):
             return Intent(IntentType.EMOTIONAL_STATE, 0.85, scenario=AIScenario.COMEBACK, user_message=text)
@@ -163,6 +268,7 @@ class IntentService:
                 0.72,
                 task_title=first.title,
                 reminder_at=first.remind_at,
+                recurrence_kind=first.recurrence_kind,
                 repeat_every_minutes=first.repeat_every_minutes,
                 task_creations=tuple(schedule_tasks),
                 user_message=text,
@@ -171,6 +277,19 @@ class IntentService:
         help_scenario = _detect_task_help(normalized)
         if help_scenario:
             return Intent(IntentType.TASK_HELP, 0.85, scenario=help_scenario, user_message=text)
+
+        parsed = _parse_creation(text, normalized, now, timezone)
+        if parsed:
+            return Intent(
+                IntentType.CREATE_TASK,
+                0.8,
+                task_title=parsed.title,
+                reminder_at=parsed.remind_at,
+                recurrence_kind=parsed.recurrence_kind,
+                repeat_every_minutes=parsed.repeat_every_minutes,
+                task_creations=(parsed,),
+                user_message=text,
+            )
 
         if _is_general_chat(normalized):
             return Intent(IntentType.GENERAL_CHAT, 0.75, scenario=AIScenario.GENERAL_CHAT, user_message=text)
@@ -182,6 +301,7 @@ class IntentService:
                 0.8,
                 task_title=parsed.title,
                 reminder_at=parsed.remind_at,
+                recurrence_kind=parsed.recurrence_kind,
                 repeat_every_minutes=parsed.repeat_every_minutes,
                 task_creations=(parsed,),
                 user_message=text,
@@ -199,6 +319,7 @@ def _parse_creation(
     if _detect_task_query(normalized):
         return None
 
+    recurrence_kind = _extract_recurrence_kind(normalized)
     loose = _parse_loose_task_request(normalized, now, timezone)
     if loose:
         return loose
@@ -208,8 +329,10 @@ def _parse_creation(
         if parsed:
             return ParsedTaskCreation(
                 title=_cleanup_title(parsed.title),
-                remind_at=parsed.remind_at,
+                remind_at=_adjust_due_at_for_recurrence(parsed.remind_at, normalized, now, timezone, recurrence_kind),
+                recurrence_kind=recurrence_kind,
                 repeat_every_minutes=_extract_repeat_minutes(normalized),
+                description=None,
             )
     except TimeParseError:
         return None
@@ -218,8 +341,10 @@ def _parse_creation(
     if title:
         return ParsedTaskCreation(
             title=title,
-            remind_at=_extract_due_at(normalized, now, timezone) or now.astimezone(timezone),
+            remind_at=_extract_due_at(normalized, now, timezone, recurrence_kind) or now.astimezone(timezone),
+            recurrence_kind=recurrence_kind,
             repeat_every_minutes=_extract_repeat_minutes(normalized),
+            description=None,
         )
 
     return None
@@ -236,7 +361,7 @@ def _intent_from_ai_payload(
 
     intent_type = str(payload.get("intent") or "").strip().lower()
     confidence = _clamp_confidence(payload.get("confidence"))
-    normalized = _normalize(raw_text)
+    normalized = _normalize_intent_text(raw_text)
 
     if intent_type == IntentType.TASK_QUERY.value:
         query = _parse_task_query(payload.get("query")) or _detect_task_query(normalized)
@@ -254,6 +379,7 @@ def _intent_from_ai_payload(
             confidence,
             task_title=first.title,
             reminder_at=first.remind_at,
+            recurrence_kind=first.recurrence_kind,
             repeat_every_minutes=first.repeat_every_minutes,
             task_creations=tuple(task_creations),
             user_message=raw_text,
@@ -329,6 +455,9 @@ def _parse_ai_task_creations(
     now: datetime,
     timezone: ZoneInfo,
 ) -> list[ParsedTaskCreation]:
+    payload_recurrence_kind = _parse_recurrence_kind(payload.get("recurrence_kind")) or _extract_recurrence_kind(
+        _normalize_intent_text(raw_text)
+    )
     raw_tasks = payload.get("tasks")
     if not isinstance(raw_tasks, list):
         raw_tasks = [
@@ -337,11 +466,13 @@ def _parse_ai_task_creations(
                 "reminder_phrase": payload.get("reminder_phrase"),
                 "reminder_at": payload.get("reminder_at"),
                 "repeat_every_minutes": payload.get("repeat_every_minutes"),
+                "description": payload.get("description"),
+                "recurrence_kind": payload.get("recurrence_kind"),
             }
         ]
 
     result: list[ParsedTaskCreation] = []
-    normalized_raw_text = _normalize(raw_text)
+    normalized_raw_text = _normalize_intent_text(raw_text)
     for item in raw_tasks[:10]:
         if not isinstance(item, dict):
             continue
@@ -352,19 +483,26 @@ def _parse_ai_task_creations(
 
         reminder_phrase = str(item.get("reminder_phrase") or item.get("time") or "").strip()
         reminder_at_raw = str(item.get("reminder_at") or item.get("remind_at") or "").strip()
+        recurrence_kind = _parse_recurrence_kind(item.get("recurrence_kind")) or payload_recurrence_kind
         remind_at = _parse_ai_reminder_at(
             reminder_at_raw,
             reminder_phrase,
             normalized_raw_text,
             now,
             timezone,
+            recurrence_kind,
         )
         repeat_every_minutes = _parse_optional_int(item.get("repeat_every_minutes"))
+        description = _cleanup_description(
+            str(item.get("description") or item.get("comment") or item.get("note") or "").strip()
+        )
         result.append(
             ParsedTaskCreation(
                 title=title,
                 remind_at=remind_at,
+                recurrence_kind=recurrence_kind,
                 repeat_every_minutes=repeat_every_minutes,
+                description=description,
             )
         )
 
@@ -377,27 +515,29 @@ def _parse_ai_reminder_at(
     normalized_raw_text: str,
     now: datetime,
     timezone: ZoneInfo,
+    recurrence_kind: RecurrenceKind = RecurrenceKind.NONE,
 ) -> datetime:
     if reminder_at_raw:
         try:
             parsed = datetime.fromisoformat(reminder_at_raw)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone)
-            return parsed.astimezone(timezone)
+            return _adjust_due_at_for_recurrence(parsed.astimezone(timezone), normalized_raw_text, now, timezone, recurrence_kind)
         except ValueError:
             pass
 
     if reminder_phrase:
         phrase = _normalize(reminder_phrase)
-        extracted = _extract_due_at(phrase, now, timezone)
+        extracted = _extract_due_at(phrase, now, timezone, recurrence_kind)
         if extracted is not None:
             return extracted
         try:
-            return parse_time_input(reminder_phrase, now, timezone)
+            parsed = parse_time_input(reminder_phrase, now, timezone)
+            return _adjust_due_at_for_recurrence(parsed, phrase, now, timezone, recurrence_kind)
         except TimeParseError:
             pass
 
-    extracted = _extract_due_at(normalized_raw_text, now, timezone)
+    extracted = _extract_due_at(normalized_raw_text, now, timezone, recurrence_kind)
     if extracted is not None:
         return extracted
     return now.astimezone(timezone)
@@ -495,6 +635,10 @@ def _is_general_chat(normalized: str) -> bool:
     if normalized.endswith("?") and normalized.startswith(question_starts):
         return True
 
+    if _extract_recurrence_kind(normalized) != RecurrenceKind.NONE:
+        cleaned = _cleanup_title(_remove_due_phrase_from_title(normalized))
+        if len(cleaned) >= 3 and not _looks_like_general_question(cleaned):
+            return True
     return False
 
 
@@ -506,7 +650,8 @@ def _parse_loose_task_request(
     if _detect_task_query(normalized):
         return None
 
-    if not _has_create_task_signal(normalized):
+    recurrence_kind = _extract_recurrence_kind(normalized)
+    if not _has_create_task_signal(normalized) and recurrence_kind == RecurrenceKind.NONE:
         return None
 
     title = _extract_marked_title(normalized)
@@ -520,8 +665,10 @@ def _parse_loose_task_request(
 
     return ParsedTaskCreation(
         title=title,
-        remind_at=_extract_due_at(normalized, now, timezone) or now.astimezone(timezone),
+        remind_at=_extract_due_at(normalized, now, timezone, recurrence_kind) or now.astimezone(timezone),
+        recurrence_kind=recurrence_kind,
         repeat_every_minutes=_extract_repeat_minutes(normalized),
+        description=None,
     )
 
 
@@ -535,12 +682,13 @@ def _parse_schedule_plan(
 
     local_now = now.astimezone(timezone)
     default_day = _target_date(normalized, local_now)
+    recurrence_kind = _extract_recurrence_kind(normalized)
     parts = _split_schedule_parts(normalized)
     tasks: list[ParsedTaskCreation] = []
     seen: set[tuple[str, datetime]] = set()
 
     for part in parts:
-        parsed = _parse_schedule_part(part, default_day, local_now, timezone)
+        parsed = _parse_schedule_part(part, default_day, local_now, timezone, recurrence_kind)
         if parsed is None:
             continue
         key = (parsed.title, parsed.remind_at)
@@ -596,6 +744,7 @@ def _parse_schedule_part(
     default_day: date | None,
     local_now: datetime,
     timezone: ZoneInfo,
+    recurrence_kind: RecurrenceKind = RecurrenceKind.NONE,
 ) -> ParsedTaskCreation | None:
     match = _parse_schedule_time_match(part)
     if match is None:
@@ -618,12 +767,14 @@ def _parse_schedule_part(
     target_day = default_day or local_now.date()
     remind_at = datetime.combine(target_day, time(hour=converted_hour, minute=minute), tzinfo=timezone)
     if default_day is None and remind_at < local_now - timedelta(seconds=30):
-        remind_at += timedelta(days=1)
+        remind_at += timedelta(days=7 if recurrence_kind == RecurrenceKind.WEEKLY else 1)
 
     return ParsedTaskCreation(
         title=title,
         remind_at=remind_at,
+        recurrence_kind=recurrence_kind,
         repeat_every_minutes=None,
+        description=None,
     )
 
 
@@ -655,7 +806,12 @@ def _extract_marked_title(normalized: str) -> str | None:
     return None
 
 
-def _extract_due_at(normalized: str, now: datetime, timezone: ZoneInfo) -> datetime | None:
+def _extract_due_at(
+    normalized: str,
+    now: datetime,
+    timezone: ZoneInfo,
+    recurrence_kind: RecurrenceKind = RecurrenceKind.NONE,
+) -> datetime | None:
     relative = re.search(
         r"\bчерез\s+(\d{1,4})\s*(минут(?:у|ы)?|мин|м|час(?:а|ов)?|ч)\b",
         normalized,
@@ -678,9 +834,14 @@ def _extract_due_at(normalized: str, now: datetime, timezone: ZoneInfo) -> datet
     ):
         target_day = calendar_day or local_now.date()
         target = datetime.combine(target_day, absolute_day_time, tzinfo=timezone)
-        if calendar_day is None and target < local_now - timedelta(seconds=30):
-            target += timedelta(days=1)
-        return target
+        return _adjust_due_at_for_recurrence(
+            target,
+            normalized,
+            now,
+            timezone,
+            recurrence_kind,
+            has_explicit_day=calendar_day is not None,
+        )
 
     absolute = re.search(
         r"(?:\bв|\bна)?\s*(\d{1,2})[:.](\d{2})(?:\s*(?:сегодня|сегодняшнего\s+дня))?",
@@ -692,14 +853,50 @@ def _extract_due_at(normalized: str, now: datetime, timezone: ZoneInfo) -> datet
         if hour > 23 or minute > 59:
             return None
         target = datetime.combine(local_now.date(), time(hour=hour, minute=minute), tzinfo=timezone)
-        if target < local_now - timedelta(seconds=30):
-            target += timedelta(days=1)
-        return target
+        return _adjust_due_at_for_recurrence(target, normalized, now, timezone, recurrence_kind)
 
     if re.search(r"\b(сейчас|прямо сейчас)\b", normalized):
         return now.astimezone(timezone)
 
     return None
+
+
+def _adjust_due_at_for_recurrence(
+    due_at: datetime,
+    normalized: str,
+    now: datetime,
+    timezone: ZoneInfo,
+    recurrence_kind: RecurrenceKind,
+    has_explicit_day: bool = False,
+) -> datetime:
+    localized = due_at.astimezone(timezone)
+    local_now = now.astimezone(timezone)
+    if localized >= local_now - timedelta(seconds=30):
+        return localized
+    if has_explicit_day or _has_explicit_day_hint(normalized):
+        return localized
+    if recurrence_kind == RecurrenceKind.WEEKLY:
+        return localized + timedelta(days=7)
+    return localized + timedelta(days=1)
+
+
+def _has_explicit_day_hint(normalized: str) -> bool:
+    return bool(re.search(r"\b(СЃРµРіРѕРґРЅСЏ|СЃРµРіРѕРґРЅСЏС€РЅРµРіРѕ\s+РґРЅСЏ|Р·Р°РІС‚СЂР°)\b", normalized))
+
+
+def _parse_recurrence_kind(value: object) -> RecurrenceKind | None:
+    try:
+        return RecurrenceKind(str(value).strip().lower())
+    except ValueError:
+        return None
+
+
+def _extract_recurrence_kind(normalized: str) -> RecurrenceKind:
+    if re.search(r"\b(РµР¶РµРґРЅРµРІРЅРѕ|РєР°Р¶РґС‹Р№\s+РґРµРЅСЊ|РєР°Р¶РґРѕРµ\s+СѓС‚СЂРѕ|РєР°Р¶РґС‹Р№\s+РІРµС‡РµСЂ)\b", normalized):
+        return RecurrenceKind.DAILY
+    if re.search(r"\b(РµР¶РµРЅРµРґРµР»СЊРЅРѕ|РєР°Р¶РґСѓСЋ\s+РЅРµРґРµР»СЋ|РєР°Р¶РґС‹Р№\s+РїРѕРЅРµРґРµР»СЊРЅРёРє|РєР°Р¶РґС‹Р№\s+РІС‚РѕСЂРЅРёРє|РєР°Р¶РґСѓСЋ\s+СЃСЂРµРґСѓ|РєР°Р¶РґС‹Р№\s+С‡РµС‚РІРµСЂРі|РєР°Р¶РґСѓСЋ\s+РїСЏС‚РЅРёС†Сѓ|РєР°Р¶РґСѓСЋ\s+СЃСѓР±Р±РѕС‚Сѓ|РєР°Р¶РґРѕРµ\s+РІРѕСЃРєСЂРµСЃРµРЅСЊРµ)\b", normalized):
+        return RecurrenceKind.WEEKLY
+    return RecurrenceKind.NONE
 
 
 def _target_date(normalized: str, local_now: datetime) -> date | None:
@@ -763,6 +960,7 @@ def _remove_due_phrase_from_title(value: str) -> str:
     text = re.sub(r"\bв\s+\d{1,2}(?:[:.]\d{2})?\s*(?:утра|дня|вечера|ночи)\b", " ", text)
     text = re.sub(r"\b(?:в|к|на)\s+\d{1,2}\b", " ", text)
     text = re.sub(r"\b(?:утром|днем|днём|вечером|ночью)\b", " ", text)
+    text = re.sub(r"\b(?:РµР¶РµРґРЅРµРІРЅРѕ|РµР¶РµРЅРµРґРµР»СЊРЅРѕ|РєР°Р¶РґС‹Р№\s+РґРµРЅСЊ|РєР°Р¶РґСѓСЋ\s+РЅРµРґРµР»СЋ)\b", " ", text)
     return _normalize(text)
 
 
@@ -793,6 +991,7 @@ def _remove_schedule_and_instruction_parts(normalized: str) -> str:
     )
     text = re.sub(r"\b(?:напомни|напоминать|поставь\s+напоминание)\s+(?:мне\s+)?", " ", text)
     text = re.sub(r"\b(?:утром|днем|днём|вечером|ночью)\b", " ", text)
+    text = re.sub(r"\b(?:РµР¶РµРґРЅРµРІРЅРѕ|РµР¶РµРЅРµРґРµР»СЊРЅРѕ|РєР°Р¶РґС‹Р№\s+РґРµРЅСЊ|РєР°Р¶РґСѓСЋ\s+РЅРµРґРµР»СЋ)\b", " ", text)
     text = _cut_instruction_tail(text)
     return _remove_due_phrase_from_title(text)
 
@@ -858,9 +1057,8 @@ def _has_create_task_signal(normalized: str) -> bool:
     if re.search(r"\b(напомни|напоминать|дожимай|пинай)\b", normalized):
         return True
     if re.search(
-        r"\b(добавь|добавить|создай|создать|запиши|поставь|поставить)\s+"
-        r"(?:мне\s+)?(?:еще|ещё|новую|новое|следующую)?\s*"
-        r"(?:задач|дело|напоминан)",
+        rf"\b(добавь|добавить|создай|создать|запиши|поставь|поставить)\s+"
+        rf"(?:мне\s+)?(?:(?:{TASK_CREATION_MODIFIER_RE})\s+)*(?:{TASK_NOUN_RE})",
         normalized,
     ):
         return True
@@ -897,6 +1095,10 @@ def _detect_task_query(normalized: str) -> TaskQuery | None:
 
 
 def _detect_task_advice_query(normalized: str) -> AIScenario | None:
+    if _prefers_plain_chat(normalized):
+        return None
+    if _detect_support_scenario(normalized) is not None:
+        return None
     if not re.search(r"\b(задач|дел[ао]?|напоминан)", normalized):
         return None
 
@@ -920,6 +1122,7 @@ def _detect_procrastination(normalized: str) -> AIScenario | None:
         "всё горит",
         "не понимаю что делать",
         "не понимаю, что делать",
+        "не вывожу",
     ]
     if any(word in normalized for word in panic_words):
         return AIScenario.PANIC
@@ -941,7 +1144,20 @@ def _detect_procrastination(normalized: str) -> AIScenario | None:
     if any(word in normalized for word in procrastination_words):
         return AIScenario.PROCRASTINATION
 
-    comeback_words = ["отвлекся", "отвлеклась", "залип", "залипла", "выпал", "выпала"]
+    comeback_words = [
+        "отвлекся",
+        "отвлеклась",
+        "залип",
+        "залипла",
+        "выпал",
+        "выпала",
+        "сдаюсь",
+        "опускаются руки",
+        "не тяну",
+        "не вывожу",
+        "все достало",
+        "всё достало",
+    ]
     if any(word in normalized for word in comeback_words):
         return AIScenario.COMEBACK
     return None
@@ -951,6 +1167,8 @@ def _is_emotional_state(normalized: str) -> bool:
     words = [
         "устал",
         "устала",
+        "устал от задач",
+        "устала от задач",
         "ничего не хочу",
         "ничего не хочется",
         "нет желания",
@@ -961,6 +1179,11 @@ def _is_emotional_state(normalized: str) -> bool:
         "нет ресурса",
         "выгорел",
         "выгорела",
+        "вымотался",
+        "вымоталась",
+        "задолбался",
+        "задолбалась",
+        "не вывожу",
         "тяжело",
         "раздражает",
         "раздражена",
@@ -995,9 +1218,13 @@ def _detect_motivation(normalized: str) -> AIScenario | None:
 
 
 def _asks_for_motivation_media(normalized: str) -> bool:
-    action_words = ["кинь", "скинь", "дай", "пришли", "отправь", "можешь кинуть", "можешь скинуть"]
+    action_words = ["кинь", "скинь", "дай", "давай", "пришли", "отправь", "можешь кинуть", "можешь скинуть"]
     media_words = ["трек", "видос", "видосик", "видео", "ролик", "буст"]
-    return any(word in normalized for word in action_words) and any(word in normalized for word in media_words)
+    repeat_words = ["еще", "ещё", "еще один", "ещё один", "еще раз", "ещё раз", "другой", "другую", "следующий", "следующее", "новый", "новое"]
+    return any(word in normalized for word in media_words) and (
+        any(word in normalized for word in action_words)
+        or any(word in normalized for word in repeat_words)
+    )
 
 
 def _detect_task_help(normalized: str) -> AIScenario | None:
@@ -1041,7 +1268,13 @@ def _cleanup_title(value: str) -> str:
     )
     title = re.sub(r"^(?:сделать|доделать|закончить|подготовить)\s+", "", title)
     title = title.strip(" .,!?:;—-")
+    title = re.sub(r"\b(?:РµР¶РµРґРЅРµРІРЅРѕ|РµР¶РµРЅРµРґРµР»СЊРЅРѕ|РєР°Р¶РґС‹Р№\s+РґРµРЅСЊ|РєР°Р¶РґСѓСЋ\s+РЅРµРґРµР»СЋ)\b", "", title)
     return title[:255]
+
+
+def _cleanup_description(value: str) -> str | None:
+    description = " ".join(value.strip(" .,!?:;—-").split())
+    return description[:1000] if description else None
 
 
 def _looks_like_task(value: str) -> bool:
@@ -1108,5 +1341,194 @@ def _looks_like_general_question(value: str) -> bool:
     return normalized.startswith(starts) or normalized.endswith("?")
 
 
+def _normalize_intent_text(text: str) -> str:
+    normalized = _normalize(text)
+    if not normalized:
+        return normalized
+    return _normalize_control_words(normalized)
+
+
+def _normalize_control_words(normalized: str) -> str:
+    tokens = normalized.split()
+    corrected: list[str] = []
+    for index, token in enumerate(tokens):
+        replacement = None
+        if index < 3:
+            replacement = _best_control_word_match(token, FUZZY_CREATE_VERBS)
+        if replacement is None and index < 5:
+            replacement = _best_control_word_match(token, FUZZY_TASK_NOUNS)
+        if replacement is None:
+            replacement = _best_control_word_match(token, FUZZY_DAILY_RECURRENCE_WORDS)
+        if replacement is None:
+            replacement = _best_control_word_match(token, FUZZY_WEEKLY_RECURRENCE_WORDS)
+        corrected.append(replacement or token)
+    return " ".join(corrected)
+
+
+def _best_control_word_match(token: str, candidates: tuple[str, ...]) -> str | None:
+    if token in candidates:
+        return token
+
+    best_match: str | None = None
+    best_length_delta: int | None = None
+    for candidate in candidates:
+        if not _is_single_typo_variant(token, candidate):
+            continue
+        length_delta = abs(len(candidate) - len(token))
+        if best_match is None or best_length_delta is None or length_delta < best_length_delta:
+            best_match = candidate
+            best_length_delta = length_delta
+    return best_match
+
+
+def _is_single_typo_variant(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+
+    if len(left) == len(right):
+        diffs = [index for index, pair in enumerate(zip(left, right)) if pair[0] != pair[1]]
+        if len(diffs) == 1:
+            return True
+        if len(diffs) == 2:
+            first, second = diffs
+            return (
+                second == first + 1
+                and left[first] == right[second]
+                and left[second] == right[first]
+            )
+        return False
+
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    short_index = 0
+    long_index = 0
+    skipped = False
+    while short_index < len(shorter) and long_index < len(longer):
+        if shorter[short_index] == longer[long_index]:
+            short_index += 1
+            long_index += 1
+            continue
+        if skipped:
+            return False
+        skipped = True
+        long_index += 1
+    return True
+
+
+def _prefers_plain_chat(normalized: str) -> bool:
+    phrases = [
+        "как человек",
+        "просто поговорить",
+        "просто общаться",
+        "поговори со мной",
+        "выслушай",
+        "мне надо выговориться",
+        "хочу выговориться",
+        "мне нужно выговориться",
+        "не про задачи",
+        "без задач",
+    ]
+    return any(phrase in normalized for phrase in phrases)
+
+
+def _detect_support_scenario(normalized: str) -> AIScenario | None:
+    if _is_emotional_state(normalized):
+        return AIScenario.COMEBACK
+    return _detect_procrastination(normalized)
+
+
+def _support_intent_type(scenario: AIScenario) -> IntentType:
+    if scenario in {AIScenario.COMEBACK, AIScenario.PANIC}:
+        return IntentType.EMOTIONAL_STATE
+    return IntentType.PROCRASTINATION
+
+
 def _normalize(text: str) -> str:
     return " ".join(text.strip().lower().split())
+
+
+def _has_explicit_day_hint(normalized: str) -> bool:
+    return bool(re.search(rf"\b{EXPLICIT_DAY_HINT_RE}\b", normalized))
+
+
+def _extract_recurrence_kind(normalized: str) -> RecurrenceKind:
+    if re.search(rf"\b{DAILY_RECURRENCE_RE}\b", normalized):
+        return RecurrenceKind.DAILY
+    if re.search(rf"\b{WEEKLY_RECURRENCE_RE}\b", normalized):
+        return RecurrenceKind.WEEKLY
+    return RecurrenceKind.NONE
+
+
+def _remove_due_phrase_from_title(value: str) -> str:
+    day_words = "(?:\u0437\u0430\u0432\u0442\u0440\u0430|\u0441\u0435\u0433\u043e\u0434\u043d\u044f|\u0441\u0435\u0433\u043e\u0434\u043d\u044f\u0448\u043d\u0435\u0433\u043e\\s+\u0434\u043d\u044f)"
+    part_of_day = "(?:\u0443\u0442\u0440\u0430|\u0434\u043d\u044f|\u0432\u0435\u0447\u0435\u0440\u0430|\u043d\u043e\u0447\u0438)"
+    text = value
+    text = re.sub(rf"\b{day_words}\s+(?:\u0432\s+)?\d{{1,2}}(?:[:.]\d{{2}})?\s*{part_of_day}?\b", " ", text)
+    text = re.sub(rf"\b(?:\u0432\s+)?\d{{1,2}}(?:[:.]\d{{2}})?\s*{part_of_day}?\s*{day_words}\b", " ", text)
+    text = re.sub(rf"\b\u0432\s+\d{{1,2}}(?:[:.]\d{{2}})?\s*{part_of_day}\b", " ", text)
+    text = re.sub(r"\b(?:\u0432|\u043a|\u043d\u0430)\s+\d{1,2}\b", " ", text)
+    text = re.sub(
+        r"\b(?:\u0443\u0442\u0440\u043e\u043c|\u0434\u043d\u0435\u043c|\u0434\u043d\u0451\u043c|\u0432\u0435\u0447\u0435\u0440\u043e\u043c|\u043d\u043e\u0447\u044c\u044e)\b",
+        " ",
+        text,
+    )
+    text = re.sub(rf"\b{RECURRENCE_PHRASES_RE}\b", " ", text)
+    return _normalize(text)
+
+
+def _remove_schedule_and_instruction_parts(normalized: str) -> str:
+    text = normalized
+    text = re.sub(
+        r"\b(?:\u0432|\u043d\u0430)?\s*\d{1,2}[:.]\d{2}(?:\s*(?:\u0441\u0435\u0433\u043e\u0434\u043d\u044f|\u0441\u0435\u0433\u043e\u0434\u043d\u044f\u0448\u043d\u0435\u0433\u043e\s+\u0434\u043d\u044f))?",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\b\u0447\u0435\u0440\u0435\u0437\s+\d{1,4}\s*(?:\u043c\u0438\u043d\u0443\u0442(?:\u0443|\u044b)?|\u043c\u0438\u043d|\u043c|\u0447\u0430\u0441(?:\u0430|\u043e\u0432)?|\u0447)\b",
+        " ",
+        text,
+    )
+    text = re.sub(
+        rf"\b(?:\u043c\u043d\u0435\s+)?(?:\u043d\u0430\u0434\u043e|\u043d\u0443\u0436\u043d\u043e)\s+\u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c\s+(?:(?:{TASK_CREATION_MODIFIER_RE})\s+)*(?:{TASK_NOUN_RE})\b",
+        " ",
+        text,
+    )
+    text = re.sub(
+        rf"\b(?:\u0434\u043e\u0431\u0430\u0432\u044c|\u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c|\u0441\u043e\u0437\u0434\u0430\u0439|\u0441\u043e\u0437\u0434\u0430\u0442\u044c|\u043f\u043e\u0441\u0442\u0430\u0432\u044c|\u043f\u043e\u0441\u0442\u0430\u0432\u0438\u0442\u044c|\u0437\u0430\u043f\u0438\u0448\u0438)\s+"
+        rf"(?:\u043c\u043d\u0435\s+)?(?:(?:{TASK_CREATION_MODIFIER_RE})\s+)*(?:{TASK_NOUN_RE})\b",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:\u043d\u0430\u043f\u043e\u043c\u043d\u0438|\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u0442\u044c|\u043f\u043e\u0441\u0442\u0430\u0432\u044c\s+\u043d\u0430\u043f\u043e\u043c\u0438\u043d\u0430\u043d\u0438\u0435)\s+(?:\u043c\u043d\u0435\s+)?",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:\u0443\u0442\u0440\u043e\u043c|\u0434\u043d\u0435\u043c|\u0434\u043d\u0451\u043c|\u0432\u0435\u0447\u0435\u0440\u043e\u043c|\u043d\u043e\u0447\u044c\u044e)\b",
+        " ",
+        text,
+    )
+    text = re.sub(rf"\b{RECURRENCE_PHRASES_RE}\b", " ", text)
+    text = _cut_instruction_tail(text)
+    return _remove_due_phrase_from_title(text)
+
+
+def _cleanup_title(value: str) -> str:
+    title = value.strip(" .,!?:;—-")
+    title = _cut_instruction_tail(title)
+    title = re.sub(
+        rf"^(?:\u0434\u043e\u0431\u0430\u0432\u044c|\u0434\u043e\u0431\u0430\u0432\u0438\u0442\u044c|\u0441\u043e\u0437\u0434\u0430\u0439|\u0441\u043e\u0437\u0434\u0430\u0442\u044c|\u043f\u043e\u0441\u0442\u0430\u0432\u044c|\u043f\u043e\u0441\u0442\u0430\u0432\u0438\u0442\u044c|\u0437\u0430\u043f\u0438\u0448\u0438)\s+"
+        rf"(?:\u043c\u043d\u0435\s+)?(?:(?:{TASK_CREATION_MODIFIER_RE})\s+)*(?:{TASK_NOUN_RE})\s*",
+        "",
+        title,
+    )
+    title = re.sub(
+        r"^(?:\u0441\u0434\u0435\u043b\u0430\u0442\u044c|\u0434\u043e\u0434\u0435\u043b\u0430\u0442\u044c|\u0437\u0430\u043a\u043e\u043d\u0447\u0438\u0442\u044c|\u043f\u043e\u0434\u0433\u043e\u0442\u043e\u0432\u0438\u0442\u044c)\s+",
+        "",
+        title,
+    )
+    title = re.sub(rf"\b{RECURRENCE_PHRASES_RE}\b", "", title)
+    title = title.strip(" .,!?:;—-")
+    return title[:255]

@@ -177,6 +177,9 @@ class ReminderScheduler:
         task, reminder = due
         if reminder.kind == ReminderKind.START:
             await self._send_start_reminder(task)
+            recurring = self.task_service.ensure_future_recurring_task(task.id)
+            if recurring:
+                self.schedule_reminder(recurring[1])
             next_reminder = self.task_service.plan_next_start_reminder(task.id)
             if next_reminder:
                 self.schedule_reminder(next_reminder)

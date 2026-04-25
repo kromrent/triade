@@ -335,11 +335,14 @@ INTENT_CLASSIFIER_INSTRUCTIONS = """
   "tasks": [
     {
       "title": string,
+      "description": string|null,
       "reminder_phrase": string|null,
       "reminder_at": string|null,
+      "recurrence_kind": "none|daily|weekly"|null,
       "repeat_every_minutes": number|null
     }
   ],
+  "recurrence_kind": "none|daily|weekly"|null,
   "repeat_every_minutes": number|null,
   "action": "start|done|snooze|cancel|cancel_all"|null,
   "minutes": number|null,
@@ -357,6 +360,7 @@ INTENT_CLASSIFIER_INSTRUCTIONS = """
 - Если пользователь пишет расписание или план с несколькими пунктами и временем, это create_task, даже если нет слова "добавь". Например: "план на завтра: встать в 10, умыться в 10:10, диплом в 11".
 - Если пользователь просто прислал список действий с временами через запятую, считай это черновиком нескольких задач и верни create_task.
 - Для каждой задачи передай title без времени. Время положи в reminder_phrase, например "завтра 09:00" или "через 20 минут".
+- Если пользователь пишет комментарий/описание/заметку к задаче, положи это в description у нужной задачи.
 - Если время не указано, reminder_phrase=null.
 - Если дата относительная, учитывай местное время из промта.
 - Если пользователь указал время без даты, выбери ближайшее будущее в местном часовом поясе. Например, если сейчас позже 09:00, "в 9 утра" означает завтра 09:00.
@@ -367,9 +371,14 @@ INTENT_CLASSIFIER_INSTRUCTIONS = """
 - "сколько сейчас времени", "что такое..." это general_chat.
 - "ничего не хочу делать", "нет настроения", "нет желания", "нет сил" это emotional_state со scenario="comeback", а не жесткий procrastination.
 - Если пользователь отвечает на предыдущий вопрос ассистента коротко: "да", "нет", "да прибавилось", "норм", "чуть лучше", "не особо", "пока нет" - это продолжение обычного диалога, intent=general_chat, если нет явной команды с задачей.
+- Фразы вроде "да вернулся спасибо", "вернулся", "спасибо", "понял", "ок брат", "стало лучше", "полегче" после поддерживающего ответа ассистента - это general_chat, не procrastination и не task_management.
 - Не запускай motivation/boost только потому, что в контексте был мотивационный трек. Для boost нужен явный текущий запрос пользователя: "дай пинок", "мотивируй", "кинь трек", "скинь видос", "дай буст".
 - Если пользователь просто хочет поговорить, спрашивает мнение, задает общий вопрос или отвечает на реплику ассистента, выбирай general_chat. Бот ответит как собеседник, без создания задач и без отправки трека.
+- Не цепляйся к отдельным словам. Смотри на смысл текущего сообщения с учетом контекста: ответ на вопрос ассистента должен продолжать разговор, а не запускать новый сценарий дожима.
 - Не придумывай задачу из вопроса.
+- If the task is recurring, set `recurrence_kind` to `daily` or `weekly`; otherwise use `none` or `null`.
+- Phrases like "каждый день" or "ежедневно" mean `recurrence_kind="daily"`.
+- Phrases like "каждую неделю", "еженедельно", or a weekday mean `recurrence_kind="weekly"`.
 """.strip()
 
 
@@ -388,11 +397,14 @@ FORCE_CREATE_TASK_INSTRUCTIONS = """
   "tasks": [
     {
       "title": string,
+      "description": string|null,
       "reminder_phrase": string|null,
       "reminder_at": string|null,
+      "recurrence_kind": "none|daily|weekly"|null,
       "repeat_every_minutes": number|null
     }
   ],
+  "recurrence_kind": "none|daily|weekly"|null,
   "repeat_every_minutes": number|null,
   "action": null,
   "minutes": null,
@@ -407,6 +419,7 @@ FORCE_CREATE_TASK_INSTRUCTIONS = """
 - Расписание или список действий с временами разбей на отдельные tasks. Например: "встать в 10, умыться в 10:10, диплом в 11" это три задачи.
 - Если в сообщении есть общий день ("на завтра", "сегодня"), применяй его ко всем пунктам списка.
 - title должен быть без времени и без слов "добавь задачу", "добавь еще задачу", "напомни", "поставь".
+- description заполняй, если пользователь добавляет комментарий/описание/заметку к задаче.
 - Время положи в reminder_phrase: "завтра 09:00", "сегодня 15:30", "через 20 минут".
 - Если время не указано, reminder_phrase=null.
 - Учитывай местное время и часовой пояс из промта.
@@ -414,6 +427,9 @@ FORCE_CREATE_TASK_INSTRUCTIONS = """
 - Если пришлось додумать дату или слегка очистить формулировку, ставь confidence 0.55-0.74, но все равно верни черновик.
 - Если видны задача и время, не отказывайся. Верни лучший JSON-план, пользователь потом подтвердит или поправит.
 - Не обещай, что задача создана. Только JSON-план.
+- If the task is recurring, set `recurrence_kind` to `daily` or `weekly`; otherwise use `none` or `null`.
+- Phrases like "каждый день" or "ежедневно" mean `recurrence_kind="daily"`.
+- Phrases like "каждую неделю", "еженедельно", or a weekday mean `recurrence_kind="weekly"`.
 """.strip()
 
 

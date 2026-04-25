@@ -33,6 +33,12 @@ class ReminderStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class RecurrenceKind(str, Enum):
+    NONE = "none"
+    DAILY = "daily"
+    WEEKLY = "weekly"
+
+
 class ToneMode(str, Enum):
     SUPPORTIVE = "supportive"
     BALANCED = "balanced"
@@ -82,6 +88,8 @@ class Task:
     updated_at: datetime
     start_reminder_at: datetime
     repeat_every_minutes: int
+    recurrence_kind: RecurrenceKind
+    recurrence_parent_task_id: Optional[int]
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     cancelled_at: Optional[datetime]

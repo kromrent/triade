@@ -3,7 +3,7 @@ from __future__ import annotations
 from html import escape
 from zoneinfo import ZoneInfo
 
-from models import Priority, Reminder, ReminderKind, Task, TaskStatus
+from models import Priority, RecurrenceKind, Reminder, ReminderKind, Task, TaskStatus
 
 
 STATUS_LABELS = {
@@ -27,6 +27,11 @@ REMINDER_KIND_LABELS = {
     ReminderKind.FOCUS_NUDGE: "возврат в фокус",
 }
 
+RECURRENCE_LABELS = {
+    RecurrenceKind.DAILY: "ежедневная",
+    RecurrenceKind.WEEKLY: "еженедельная",
+}
+
 
 def format_dt(value, timezone_name: str) -> str:
     if value is None:
@@ -35,14 +40,39 @@ def format_dt(value, timezone_name: str) -> str:
 
 
 def format_task_created(task: Task, timezone_name: str) -> str:
-    return (
-        "<b>Задача создана</b>\n\n"
-        f"<b>{escape(task.title)}</b>\n"
-        f"Статус: {STATUS_LABELS[task.status]}\n"
-        f"Приоритет: {PRIORITY_LABELS[task.priority]}\n"
-        f"Первое напоминание: {format_dt(task.start_reminder_at, timezone_name)}\n"
-        f"Повтор: каждые {task.repeat_every_minutes} мин."
-    )
+    lines = [
+        "<b>Задача создана</b>",
+        "",
+        f"<b>{escape(task.title)}</b>",
+        f"Статус: {STATUS_LABELS[task.status]}",
+        f"Приоритет: {PRIORITY_LABELS[task.priority]}",
+        f"Первое напоминание: {format_dt(task.start_reminder_at, timezone_name)}",
+    ]
+    recurrence = format_task_recurrence(task)
+    if recurrence:
+        lines.append(f"Тип: {recurrence}")
+        lines.append("Следующее повторение создается автоматически.")
+    else:
+        lines.append(f"Повтор: каждые {task.repeat_every_minutes} мин.")
+    return "\n".join(lines)
+
+
+def format_task_already_exists(task: Task, timezone_name: str) -> str:
+    lines = [
+        "<b>Такая задача уже есть</b>",
+        "",
+        f"<b>{escape(task.title)}</b>",
+        f"Статус: {STATUS_LABELS[task.status]}",
+        f"Приоритет: {PRIORITY_LABELS[task.priority]}",
+        f"Первое напоминание: {format_dt(task.start_reminder_at, timezone_name)}",
+    ]
+    recurrence = format_task_recurrence(task)
+    if recurrence:
+        lines.append(f"Тип: {recurrence}")
+    else:
+        lines.append(f"Повтор: каждые {task.repeat_every_minutes} мин.")
+    lines.append("Новую не добавляю.")
+    return "\n".join(lines)
 
 
 def format_task_details(task: Task, timezone_name: str) -> str:
@@ -51,10 +81,15 @@ def format_task_details(task: Task, timezone_name: str) -> str:
         f"Статус: {STATUS_LABELS[task.status]}",
         f"Приоритет: {PRIORITY_LABELS[task.priority]}",
         f"Первое напоминание: {format_dt(task.start_reminder_at, timezone_name)}",
-        f"Повтор старта: каждые {task.repeat_every_minutes} мин.",
     ]
     if task.description:
         lines.insert(1, escape(task.description))
+    recurrence = format_task_recurrence(task)
+    if recurrence:
+        lines.append(f"Тип: {recurrence}")
+        lines.append("Следующее повторение создается автоматически.")
+    else:
+        lines.append(f"Повтор старта: каждые {task.repeat_every_minutes} мин.")
     if task.postponed_until:
         lines.append(f"Отложена до: {format_dt(task.postponed_until, timezone_name)}")
     if task.started_at:
@@ -77,12 +112,15 @@ def format_task_list(
 
     lines = [f"<b>{escape(title)}</b>"]
     for task in tasks:
+        recurrence = format_task_recurrence(task)
+        recurrence_line = f"\nТип: {recurrence}" if recurrence else ""
         lines.append(
             "\n"
             f"#{task.id} <b>{escape(task.title)}</b>\n"
             f"Статус: {STATUS_LABELS[task.status]}\n"
             f"Приоритет: {PRIORITY_LABELS[task.priority]}\n"
             f"Напоминание: {format_dt(task.start_reminder_at, timezone_name)}"
+            f"{recurrence_line}"
         )
     return "\n".join(lines)
 
@@ -109,6 +147,16 @@ def format_start_reminder(task: Task, timezone_name: str) -> str:
     ]
     if task.description:
         lines.append(escape(task.description))
+    recurrence = format_task_recurrence(task)
+    if recurrence:
+        lines.append(f"Тип: {recurrence}")
+        lines.extend(
+            [
+                f"Приоритет: {PRIORITY_LABELS[task.priority]}",
+                "Следующее повторение будет запланировано автоматически.",
+            ]
+        )
+        return "\n".join(lines)
     lines.extend(
         [
             f"Приоритет: {PRIORITY_LABELS[task.priority]}",
@@ -131,3 +179,9 @@ def clip_button_text(value: str, limit: int = 48) -> str:
     if len(value) <= limit:
         return value
     return f"{value[: limit - 1]}..."
+
+
+def format_task_recurrence(task: Task) -> str | None:
+    if task.recurrence_kind == RecurrenceKind.NONE:
+        return None
+    return RECURRENCE_LABELS.get(task.recurrence_kind, task.recurrence_kind.value)
